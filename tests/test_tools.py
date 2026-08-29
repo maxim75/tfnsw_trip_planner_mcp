@@ -254,7 +254,28 @@ async def test_get_alerts_forwards_arguments(ctx, client):
 async def test_get_alerts_wraps_results(ctx, client):
     client.get_alerts.return_value = ["a1"]
 
-    assert await server.get_alerts(ctx=ctx) == {"count": 1, "alerts": ["a1"]}
+    assert await server.get_alerts(ctx=ctx) == {"count": 1, "returned": 1, "alerts": ["a1"]}
+
+
+async def test_get_alerts_caps_results_and_reports_the_real_total(ctx, client):
+    # A network-wide alert fetch returns ~283 alerts / 1.3MB of JSON, which is
+    # more than a single SSE event may carry (1MiB) and far more than a model
+    # can read. Cap it, but keep the true total visible.
+    client.get_alerts.return_value = list(range(283))
+
+    result = await server.get_alerts(max_results=5, ctx=ctx)
+
+    assert result["count"] == 283
+    assert result["returned"] == 5
+    assert result["alerts"] == [0, 1, 2, 3, 4]
+
+
+async def test_get_alerts_default_cap_keeps_the_payload_transportable(ctx, client):
+    client.get_alerts.return_value = list(range(283))
+
+    result = await server.get_alerts(ctx=ctx)
+
+    assert result["returned"] < 283, "an unfiltered alert fetch must be capped by default"
 
 
 # --------------------------------------------------------------------------
@@ -277,6 +298,26 @@ async def test_find_nearby_forwards_arguments(ctx, client):
         draw_class=2,
     )
     assert result["count"] == 1
+    assert result["returned"] == 1
+
+
+async def test_find_nearby_caps_results_and_reports_the_real_total(ctx, client):
+    # A 500m radius around Circular Quay really does return ~618 locations.
+    client.find_nearby.return_value = [make_location() for _ in range(618)]
+
+    result = await server.find_nearby(latitude=-33.8613, longitude=151.2107, max_results=3, ctx=ctx)
+
+    assert result["count"] == 618
+    assert result["returned"] == 3
+    assert len(result["locations"]) == 3
+
+
+async def test_find_nearby_is_capped_by_default(ctx, client):
+    client.find_nearby.return_value = [make_location() for _ in range(618)]
+
+    result = await server.find_nearby(latitude=-33.8613, longitude=151.2107, ctx=ctx)
+
+    assert result["returned"] < 618, "a nearby search must be capped by default"
 
 
 async def test_get_vehicle_positions_caps_results_and_reports_the_real_total(ctx, client):

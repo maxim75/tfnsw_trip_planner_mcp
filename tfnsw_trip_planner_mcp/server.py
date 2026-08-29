@@ -92,6 +92,23 @@ async def _call(ctx: Context, method: str, **kwargs: Any) -> Any:
         raise ToolError(str(exc)) from None
 
 
+def _capped(items: list[Any], max_results: int, key: str) -> dict[str, Any]:
+    """Wrap a list result, truncating it to *max_results*.
+
+    Some endpoints answer with far more than a caller can use: an unfiltered
+    alert fetch returns every alert in NSW (~283, 1.3MB of JSON) and a 500m
+    nearby search can return 600+ locations. Beyond flooding the model's
+    context, an oversized reply breaks the transport outright — MCP sends the
+    payload twice (as text content and as structured content) and clients cap a
+    single SSE event at 1MiB, so a large reply is dropped mid-stream and the
+    call fails with "SSE stream ended without a response".
+
+    `count` stays the true total so truncation is visible rather than silent.
+    """
+    capped = items[:max_results]
+    return {"count": len(items), "returned": len(capped), key: to_jsonable(capped)}
+
+
 def _redact(ctx: Context, message: str) -> str:
     """Strip the caller's API key out of *message*, defensively.
 
@@ -330,19 +347,25 @@ async def get_alerts(
     when: str | None = None,
     stop_id: str | None = None,
     current_only: bool = True,
+    max_results: int = 20,
 ) -> dict[str, Any]:
     """Retrieve service alerts: disruptions, trackwork and planned changes.
+
+    Pass a stop_id whenever you can. A network-wide fetch returns every alert in
+    NSW — hundreds of them — so results are capped: `count` is the true total
+    and `returned` is how many are included.
 
     Args:
         when: Optional ISO 8601 date/time to check alerts for; Sydney local time
             if no offset given. Defaults to now.
         stop_id: Restrict to alerts affecting one stop. Omit for network-wide.
         current_only: Only alerts in effect now. Set false to include future ones.
+        max_results: Maximum alerts to return.
     """
     alerts = await _call(
         ctx, "get_alerts", when=parse_when(when), stop_id=stop_id, current_only=current_only
     )
-    return {"count": len(alerts), "alerts": to_jsonable(alerts)}
+    return _capped(alerts, max_results, "alerts")
 
 
 # --------------------------------------------------------------------------
@@ -358,10 +381,14 @@ async def find_nearby(
     radius_m: int = 500,
     type_1: str = "GIS_POINT",
     draw_class: int | None = None,
+    max_results: int = 50,
 ) -> dict[str, Any]:
     """Find stops and points of interest near a GPS coordinate.
 
-    Each result carries its distance in metres from the coordinate.
+    Each result carries its distance in metres from the coordinate. A dense area
+    can return hundreds of locations within 500m, so results are capped:
+    `count` is the true total and `returned` is how many are included. Narrow
+    `radius_m` rather than raising `max_results` to get more relevant results.
 
     Args:
         latitude: Latitude in decimal degrees, e.g. -33.8613.
@@ -369,6 +396,7 @@ async def find_nearby(
         radius_m: Search radius in metres.
         type_1: TfNSW result category. "GIS_POINT" covers stops and POIs.
         draw_class: Optional TfNSW sub-category filter.
+        max_results: Maximum locations to return.
     """
     locations = await _call(
         ctx,
@@ -379,7 +407,7 @@ async def find_nearby(
         type_1=type_1,
         draw_class=draw_class,
     )
-    return {"count": len(locations), "locations": to_jsonable(locations)}
+    return _capped(locations, max_results, "locations")
 
 
 # --------------------------------------------------------------------------
@@ -409,9 +437,4 @@ async def get_vehicle_positions(
         max_results: Maximum vehicles to return.
     """
     vehicles = await _call(ctx, "vehicle_positions", mode=mode)
-    capped = vehicles[:max_results]
-    return {
-        "count": len(vehicles),
-        "returned": len(capped),
-        "vehicles": to_jsonable(capped),
-    }
+    return _capped(vehicles, max_results, "vehicles")

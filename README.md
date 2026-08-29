@@ -102,14 +102,37 @@ Notes:
 - **Times.** Tools taking a `when` accept ISO 8601, e.g. `2026-08-30T09:15`.
   Without an offset the value is Australia/Sydney local time. An unparseable
   value is rejected rather than ignored.
+- **Capped results.** `get_alerts`, `find_nearby` and `get_vehicle_positions`
+  can each answer with far more than a caller can use — an unfiltered alert
+  fetch returns every alert in NSW (~280, 1.3MB of JSON), and a 500m nearby
+  search can return 600+ locations. They take a `max_results` (20, 50 and 100
+  respectively) and report `{"count": <true total>, "returned": n, ...}`, so
+  truncation is always visible.
+
+  This is not only about context budget: MCP sends each result twice (as text
+  content and as structured content) and clients cap a single SSE event at
+  1MiB, so an oversized reply fails outright with *"SSE stream ended without a
+  response"*.
 - **`get_vehicle_positions`** reads the GTFS-Realtime feed, which is a *separate*
   product on the Open Data portal — your key must be subscribed to it as well.
-  Feeds can carry thousands of vehicles, so results are capped at `max_results`
-  (default 100); `count` reports the true feed size and `returned` how many came
-  back.
 
 Results are returned as structured JSON: lists arrive as
 `{"count": n, "<plural>": [...]}` and single lookups as `{"location": {...}}`.
+
+### Known limitation: empty location names
+
+`find_stop`, `find_stop_by_id`, `best_stop` and `find_nearby` return correct
+stop **IDs** but an empty `name`. This is an upstream bug in
+`tfnsw-trip-planner` 1.3.1: `Location.from_dict` reads the name only from
+`properties.STOP_NAME_WITH_PLACE`, which the coordinate API supplies but the
+stop-finder API does not — the latter returns it at the top level as
+`data["name"]` (`"Circular Quay, Sydney"`). The name is discarded during
+parsing, so this server cannot recover it downstream; the fix belongs in the
+library, mirroring the fallback its `id` field already has.
+
+`get_departures` is unaffected — it uses a different model that parses names
+correctly. `tests/test_live.py` carries an `xfail` test that will flip to
+passing once the library is fixed.
 
 ## Running it
 
