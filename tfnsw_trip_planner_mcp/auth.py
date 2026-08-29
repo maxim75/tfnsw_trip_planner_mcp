@@ -12,6 +12,8 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 
+import requests
+from requests.adapters import HTTPAdapter
 from tfnsw_trip_planner import TripPlannerClient
 
 __all__ = ["API_KEY_HEADER", "MissingAPIKeyError", "api_key_from_headers", "client_for"]
@@ -60,15 +62,53 @@ def api_key_from_headers(headers: Mapping[str, str] | None) -> str:
     return value
 
 
+class _SharedPoolAdapter(HTTPAdapter):
+    """An adapter whose connection pool outlives the sessions that mount it.
+
+    ``Session.close()`` closes every adapter it holds. Each tool call gets its
+    own short-lived session, so the default behaviour would discard the
+    connection pool with it and every call would pay a fresh TCP and TLS
+    handshake. Closing is therefore a no-op here: the pool is process-wide and
+    is torn down only when the process exits.
+    """
+
+    def close(self) -> None:  # pragma: no cover - trivial override
+        pass
+
+
+# Shared across every caller. This is safe precisely because a connection pool
+# is keyed by host, not by credential: it holds sockets to
+# api.transport.nsw.gov.au and nothing about who is calling. urllib3's
+# PoolManager is thread-safe, which matters because tool calls run on anyio
+# worker threads. `pool_maxsize` is raised well above the default 10 so
+# concurrent calls are not serialised on a starved pool.
+_SHARED_POOL = _SharedPoolAdapter(pool_connections=4, pool_maxsize=32)
+
+
+def _pooled_session() -> requests.Session:
+    """Return a fresh session that borrows the process-wide connection pool."""
+    session = requests.Session()
+    session.mount("https://", _SHARED_POOL)
+    session.mount("http://", _SHARED_POOL)
+    return session
+
+
 @contextmanager
 def client_for(ctx) -> Iterator[TripPlannerClient]:
     """Yield a ``TripPlannerClient`` built from the current request's API key.
 
     ``ctx`` is the MCP ``Context`` injected into a tool. Its ``headers`` are
     populated by the HTTP transports and are ``None`` under stdio.
+
+    The client and its session are per-call, but the underlying connections are
+    pooled process-wide. The split matters: ``TripPlannerClient`` writes the
+    API key into ``session.headers``, so sharing one session between callers
+    would let a second caller's key overwrite a first caller's mid-flight.
+    Sharing only the pool keeps credentials strictly per-call while still
+    reusing sockets.
     """
     api_key = api_key_from_headers(getattr(ctx, "headers", None))
-    client = TripPlannerClient(api_key=api_key)
+    client = TripPlannerClient(api_key=api_key, session=_pooled_session())
     try:
         yield client
     finally:

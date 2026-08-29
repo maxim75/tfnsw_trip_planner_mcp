@@ -25,6 +25,12 @@ TfNSW's own docs use the former.
 Each tool call builds a client from that request's key and discards it when the
 call returns, so one caller's key is never reused for another's request.
 
+HTTP **connections** are nevertheless pooled process-wide, which cuts roughly
+93ms — a TCP and TLS handshake — off every call. The split is deliberate: a
+connection pool is keyed by host, not by credential, so it can be shared safely,
+whereas the library writes the API key into `session.headers` and a shared
+*session* would let one caller's key overwrite another's mid-flight.
+
 ## Endpoints
 
 | Path | Purpose |
