@@ -173,6 +173,17 @@ Smoke tests against the real API are opt-in and skipped unless a key is present:
 TFNSW_API_KEY=your_key uv run pytest -m live
 ```
 
+### CI
+
+GitHub Actions runs on every push and pull request: ruff, the offline suite,
+and a Docker job that builds the image, waits for `/health`, and checks the
+running container lists all 10 tools.
+
+The live tests run on `main` and on manual dispatch. They **skip themselves**
+unless a `TFNSW_API_KEY` repository secret exists, so CI is green without one —
+add it under *Settings → Secrets and variables → Actions* to enable them. Fork
+pull requests never receive the secret, so they always skip.
+
 ## Layout
 
 | File | Role |

@@ -1,0 +1,109 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint and offline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      # No API key here, so the live tests skip themselves. -rs prints the
+      # skip reasons so that is visible in the log rather than implied.
+      - name: Run tests
+        run: uv run pytest -q -rs
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: tfnsw-trip-planner-mcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start container
+        run: docker run -d --name mcp -p 6401:6401 tfnsw-trip-planner-mcp:ci
+
+      - name: Wait for /health
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf localhost:6401/health; then echo; exit 0; fi
+            sleep 2
+          done
+          echo "::error::container never became healthy"
+          exit 1
+
+      # Catches a container that builds but cannot actually serve MCP —
+      # a missing runtime dependency, a bad CMD, a broken route table.
+      - name: Server lists all 10 tools
+        run: |
+          response=$(curl -sS -X POST localhost:6401/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'X-API-Key: ci-dummy-key' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
+          names=$(printf '%s\n' "$response" | sed -n 's/^data: //p' | jq -r '.result.tools[].name' | sort)
+          count=$(printf '%s\n' "$names" | grep -c .)
+          echo "$names"
+          if [ "$count" != "10" ]; then
+            echo "::error::expected 10 tools, got $count"
+            exit 1
+          fi
+
+      - name: Container logs
+        if: always()
+        run: docker logs mcp
+
+  live:
+    name: Live API smoke tests
+    # Fork PRs cannot read secrets, and there is no point spending API quota
+    # on every push to a branch. Runs on main and on manual dispatch.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # These tests skip themselves when TFNSW_API_KEY is empty, so this job
+      # stays green until the repository secret is added. See README.
+      - name: Run live tests
+        env:
+          TFNSW_API_KEY: ${{ secrets.TFNSW_API_KEY }}
+        run: uv run pytest -m live -q -rs
