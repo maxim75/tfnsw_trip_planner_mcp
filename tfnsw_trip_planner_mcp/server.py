@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import functools
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import anyio.to_thread
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import Field
 from tfnsw_trip_planner import APIError, NetworkError
 from tfnsw_trip_planner.models.enums import CyclingProfile
 
@@ -43,6 +44,10 @@ mcp = MCPServer(
 )
 
 CyclingProfileName = Literal["EASIER", "MODERATE", "MORE_DIRECT"]
+
+# Rejects a nonsensical limit at schema validation, before it can reach a slice.
+# A model passing -1 to mean "unlimited" is the case that matters.
+PositiveInt = Annotated[int, Field(ge=1)]
 
 VEHICLE_POSITION_MODES = (
     "buses",
@@ -92,8 +97,13 @@ async def _call(ctx: Context, method: str, **kwargs: Any) -> Any:
         raise ToolError(str(exc)) from None
 
 
-def _capped(items: list[Any], max_results: int, key: str) -> dict[str, Any]:
+def _capped(items: list[Any], max_results: int | None, key: str) -> dict[str, Any]:
     """Wrap a list result, truncating it to *max_results*.
+
+    Every list-returning tool goes through here so they all answer with the same
+    shape — `count` (the true total), `returned` (how many are included), and the
+    items. Pass ``max_results=None`` for endpoints the upstream API already
+    bounds; `returned` then equals `count`.
 
     Some endpoints answer with far more than a caller can use: an unfiltered
     alert fetch returns every alert in NSW (~283, 1.3MB of JSON) and a 500m
@@ -102,10 +112,15 @@ def _capped(items: list[Any], max_results: int, key: str) -> dict[str, Any]:
     payload twice (as text content and as structured content) and clients cap a
     single SSE event at 1MiB, so a large reply is dropped mid-stream and the
     call fails with "SSE stream ended without a response".
-
-    `count` stays the true total so truncation is visible rather than silent.
     """
-    capped = items[:max_results]
+    if max_results is None:
+        capped = items
+    else:
+        # Guard the slice rather than trusting the caller: items[:-1] would
+        # return all-but-one, silently undoing the cap and re-breaking the
+        # transport. The schema also enforces a minimum of 1, so this is the
+        # second line of defence, not the only one.
+        capped = items[: max(1, max_results)]
     return {"count": len(items), "returned": len(capped), key: to_jsonable(capped)}
 
 
@@ -132,7 +147,7 @@ async def find_stop(
     query: str,
     ctx: Context,
     location_type: str = "any",
-    max_results: int = 10,
+    limit: PositiveInt = 10,
 ) -> dict[str, Any]:
     """Search for stops, stations, wharves, points of interest and addresses by name.
 
@@ -143,12 +158,14 @@ async def find_stop(
         query: What to search for, e.g. "Circular Quay" or "Town Hall Station".
         location_type: Restrict results — "any", "stop", "platform", "poi",
             "address", "street" or "locality".
-        max_results: Maximum number of matches to return.
+        limit: Ask the TfNSW API to return at most this many matches. Unlike
+            max_results on the capped tools, this bounds the upstream query
+            rather than truncating a fetched list, so `count` is exact.
     """
     locations = await _call(
-        ctx, "find_stop", query=query, location_type=location_type, max_results=max_results
+        ctx, "find_stop", query=query, location_type=location_type, max_results=limit
     )
-    return {"count": len(locations), "locations": to_jsonable(locations)}
+    return _capped(locations, None, "locations")
 
 
 @mcp.tool()
@@ -224,7 +241,7 @@ async def plan_trip(
         realtime=realtime,
         wheelchair=wheelchair,
     )
-    return {"count": len(journeys), "journeys": to_jsonable(journeys)}
+    return _capped(journeys, None, "journeys")
 
 
 @mcp.tool()
@@ -263,7 +280,7 @@ async def plan_trip_from_coordinate(
         realtime=realtime,
         wheelchair=wheelchair,
     )
-    return {"count": len(journeys), "journeys": to_jsonable(journeys)}
+    return _capped(journeys, None, "journeys")
 
 
 @mcp.tool()
@@ -300,7 +317,7 @@ async def plan_cycling_trip(
         max_time_minutes=max_time_minutes,
         cycle_speed=cycle_speed,
     )
-    return {"count": len(journeys), "journeys": to_jsonable(journeys)}
+    return _capped(journeys, None, "journeys")
 
 
 # --------------------------------------------------------------------------
@@ -333,7 +350,7 @@ async def get_departures(
         platform_id=platform_id,
         realtime=realtime,
     )
-    return {"count": len(departures), "departures": to_jsonable(departures)}
+    return _capped(departures, None, "departures")
 
 
 # --------------------------------------------------------------------------
@@ -347,7 +364,7 @@ async def get_alerts(
     when: str | None = None,
     stop_id: str | None = None,
     current_only: bool = True,
-    max_results: int = 20,
+    max_results: PositiveInt = 20,
 ) -> dict[str, Any]:
     """Retrieve service alerts: disruptions, trackwork and planned changes.
 
@@ -381,7 +398,7 @@ async def find_nearby(
     radius_m: int = 500,
     type_1: str = "GIS_POINT",
     draw_class: int | None = None,
-    max_results: int = 50,
+    max_results: PositiveInt = 50,
 ) -> dict[str, Any]:
     """Find stops and points of interest near a GPS coordinate.
 
@@ -419,7 +436,7 @@ async def find_nearby(
 async def get_vehicle_positions(
     mode: str,
     ctx: Context,
-    max_results: int = 100,
+    max_results: PositiveInt = 100,
 ) -> dict[str, Any]:
     """Fetch live GPS positions of vehicles currently running on a network.
 
@@ -431,10 +448,17 @@ async def get_vehicle_positions(
     true feed size and `returned` is how many are included.
 
     Args:
-        mode: Which feed to read. Known values: "buses", "metro", "sydneytrains",
+        mode: Which feed to read. One of "buses", "metro", "sydneytrains",
             "nswtrains", "ferries/sydneyferries", "lightrail/cbdandsoutheast",
             "lightrail/newcastle", "lightrail/parramatta".
         max_results: Maximum vehicles to return.
     """
+    if mode not in VEHICLE_POSITION_MODES:
+        # An unknown feed otherwise reaches TfNSW and returns an opaque 404.
+        # Naming the valid feeds lets the model correct itself in one step.
+        raise ToolError(
+            f"Unknown vehicle position feed {mode!r}. Valid feeds are: "
+            + ", ".join(VEHICLE_POSITION_MODES)
+        )
     vehicles = await _call(ctx, "vehicle_positions", mode=mode)
     return _capped(vehicles, max_results, "vehicles")

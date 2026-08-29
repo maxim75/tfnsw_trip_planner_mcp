@@ -9,7 +9,7 @@ from tfnsw_trip_planner.models import Coordinate, Location
 from tfnsw_trip_planner.models.enums import CyclingProfile, LocationType
 
 from tfnsw_trip_planner_mcp import server
-from tfnsw_trip_planner_mcp.server import parse_when
+from tfnsw_trip_planner_mcp.server import _capped, parse_when
 
 
 def make_location(name="Circular Quay", loc_id="10101331"):
@@ -63,6 +63,75 @@ def test_parse_when_rejects_unparseable_values_loudly(bad):
 
 
 # --------------------------------------------------------------------------
+# Result capping and shape
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, -100])
+def test_capped_never_returns_more_than_asked_for_odd_limits(bad):
+    # `items[:-1]` would return all-but-one, silently un-capping the result and
+    # reintroducing the oversized payload that breaks the SSE transport. A model
+    # passing -1 to mean "no limit" is a realistic way to trigger that.
+    result = _capped(list(range(281)), bad, "alerts")
+
+    assert result["count"] == 281
+    assert result["returned"] == 1
+    assert len(result["alerts"]) == 1
+
+
+def test_capped_passes_through_when_under_the_limit():
+    result = _capped([1, 2], 50, "alerts")
+
+    assert result == {"count": 2, "returned": 2, "alerts": [1, 2]}
+
+
+def test_capped_without_a_limit_reports_everything():
+    result = _capped(list(range(7)), None, "journeys")
+
+    assert result["count"] == 7
+    assert result["returned"] == 7
+    assert len(result["journeys"]) == 7
+
+
+LIST_TOOL_KEYS = {
+    "find_stop": "locations",
+    "plan_trip": "journeys",
+    "plan_trip_from_coordinate": "journeys",
+    "plan_cycling_trip": "journeys",
+    "get_departures": "departures",
+    "get_alerts": "alerts",
+    "find_nearby": "locations",
+    "get_vehicle_positions": "vehicles",
+}
+
+LIST_TOOL_ARGS = {
+    "find_stop": {"query": "x"},
+    "plan_trip": {"origin_id": "A", "destination_id": "B"},
+    "plan_trip_from_coordinate": {"latitude": 1.0, "longitude": 2.0, "destination_id": "B"},
+    "plan_cycling_trip": {"origin_id": "A", "destination_id": "B"},
+    "get_departures": {"stop_id": "A"},
+    "get_alerts": {},
+    "find_nearby": {"latitude": 1.0, "longitude": 2.0},
+    "get_vehicle_positions": {"mode": "buses"},
+}
+
+LIBRARY_METHOD = {"get_vehicle_positions": "vehicle_positions"}
+
+
+@pytest.mark.parametrize("tool_name", sorted(LIST_TOOL_KEYS))
+async def test_every_list_tool_returns_the_same_shape(tool_name, ctx, client):
+    # One shape for every list-returning tool, so a caller can always read
+    # `returned` and always trust `count` to be the true total.
+    getattr(client, LIBRARY_METHOD.get(tool_name, tool_name)).return_value = ["a", "b"]
+
+    result = await getattr(server, tool_name)(**LIST_TOOL_ARGS[tool_name], ctx=ctx)
+
+    assert set(result) == {"count", "returned", LIST_TOOL_KEYS[tool_name]}
+    assert result["count"] == 2
+    assert result["returned"] == 2
+
+
+# --------------------------------------------------------------------------
 # Stop finding
 # --------------------------------------------------------------------------
 
@@ -83,14 +152,14 @@ async def test_find_stop_forwards_arguments_and_wraps_results(ctx, client):
 async def test_find_stop_passes_through_overrides(ctx, client):
     client.find_stop.return_value = []
 
-    result = await server.find_stop(
-        query="Town Hall", location_type="platform", max_results=3, ctx=ctx
-    )
+    result = await server.find_stop(query="Town Hall", location_type="platform", limit=3, ctx=ctx)
 
+    # `limit` is an upstream query limit, so it reaches the library as
+    # max_results rather than truncating a fetched list locally.
     client.find_stop.assert_called_once_with(
         query="Town Hall", location_type="platform", max_results=3
     )
-    assert result == {"count": 0, "locations": []}
+    assert result == {"count": 0, "returned": 0, "locations": []}
 
 
 async def test_find_stop_by_id_returns_a_single_location(ctx, client):
@@ -168,7 +237,7 @@ async def test_plan_trip_wraps_journeys(ctx, client):
 
     result = await server.plan_trip(origin_id="A", destination_id="B", ctx=ctx)
 
-    assert result == {"count": 3, "journeys": ["j1", "j2", "j3"]}
+    assert result == {"count": 3, "returned": 3, "journeys": ["j1", "j2", "j3"]}
 
 
 async def test_plan_trip_from_coordinate_forwards_the_coordinate(ctx, client):
@@ -239,6 +308,7 @@ async def test_get_departures_wraps_results(ctx, client):
 
     assert await server.get_departures(stop_id="200020", ctx=ctx) == {
         "count": 2,
+        "returned": 2,
         "departures": ["d1", "d2"],
     }
 
@@ -338,6 +408,33 @@ async def test_get_vehicle_positions_returns_everything_when_under_the_cap(ctx, 
     result = await server.get_vehicle_positions(mode="metro", ctx=ctx)
 
     assert result == {"count": 3, "returned": 3, "vehicles": [1, 2, 3]}
+
+
+async def test_get_vehicle_positions_rejects_an_unknown_feed(ctx, client):
+    # An unknown mode otherwise reaches TfNSW and comes back as an opaque 404;
+    # naming the valid feeds lets the model correct itself.
+    with pytest.raises(ToolError) as excinfo:
+        await server.get_vehicle_positions(mode="trains", ctx=ctx)
+
+    assert "sydneytrains" in str(excinfo.value)
+    client.vehicle_positions.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", server.VEHICLE_POSITION_MODES)
+async def test_every_documented_feed_is_accepted(mode, ctx, client):
+    client.vehicle_positions.return_value = []
+
+    await server.get_vehicle_positions(mode=mode, ctx=ctx)
+
+    client.vehicle_positions.assert_called_once_with(mode=mode)
+
+
+def test_the_documented_feeds_match_the_validated_ones():
+    # Keeps the docstring the model reads in step with the tuple that is
+    # actually enforced, so neither can drift from the other unnoticed.
+    doc = server.get_vehicle_positions.__doc__
+    for mode in server.VEHICLE_POSITION_MODES:
+        assert mode in doc, f"{mode} is accepted but not documented"
 
 
 async def test_get_vehicle_positions_explains_the_missing_realtime_extra(ctx, client):

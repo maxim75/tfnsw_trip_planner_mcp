@@ -106,18 +106,30 @@ Notes:
   can each answer with far more than a caller can use — an unfiltered alert
   fetch returns every alert in NSW (~280, 1.3MB of JSON), and a 500m nearby
   search can return 600+ locations. They take a `max_results` (20, 50 and 100
-  respectively) and report `{"count": <true total>, "returned": n, ...}`, so
-  truncation is always visible.
+  respectively), constrained to `>= 1`.
 
   This is not only about context budget: MCP sends each result twice (as text
   content and as structured content) and clients cap a single SSE event at
   1MiB, so an oversized reply fails outright with *"SSE stream ended without a
   response"*.
+- **`find_stop` takes `limit`, not `max_results`** — deliberately a different
+  name, because it bounds the *upstream query* rather than truncating a fetched
+  list, so `count` is exact and no bandwidth is wasted.
 - **`get_vehicle_positions`** reads the GTFS-Realtime feed, which is a *separate*
   product on the Open Data portal — your key must be subscribed to it as well.
+  An unrecognised `mode` is rejected with the list of valid feeds rather than
+  being passed through to an opaque upstream 404.
 
-Results are returned as structured JSON: lists arrive as
-`{"count": n, "<plural>": [...]}` and single lookups as `{"location": {...}}`.
+Results are returned as structured JSON. Every list-returning tool answers with
+the same shape, so `returned` is always present and `count` is always the true
+total before any capping:
+
+```json
+{"count": 618, "returned": 50, "locations": [...]}
+```
+
+Single lookups (`find_stop_by_id`, `best_stop`) return `{"location": {...}}`,
+or `{"location": null}` when nothing matches.
 
 ### Known limitation: empty location names
 

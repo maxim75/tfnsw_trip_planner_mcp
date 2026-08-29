@@ -9,6 +9,7 @@ import httpx2
 import pytest
 import uvicorn
 from mcp.client import ClientSession
+from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from tfnsw_trip_planner.models import Coordinate, Location
 from tfnsw_trip_planner.models.enums import LocationType
@@ -154,6 +155,7 @@ async def test_results_arrive_as_structured_content(base_url):
     # dict a tool returns must survive the round trip intact.
     assert result.structured_content == {
         "count": 1,
+        "returned": 1,
         "locations": [
             {
                 "id": "10101331",
@@ -200,6 +202,53 @@ async def test_a_call_without_the_header_fails_with_actionable_guidance(base_url
 
     assert result.is_error is True
     assert "X-API-Key" in result.content[0].text
+
+
+async def test_capped_tools_advertise_a_minimum_on_max_results(base_url):
+    # A schema `minimum` rejects max_results=-1 before it reaches the slice, so
+    # the transport-breaking payload cannot be requested at all.
+    async with http_client(base_url, headers={"X-API-Key": "test-key"}) as client:
+        async with streamable_http_client(f"{base_url}/mcp", http_client=client) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = {t.name: t for t in (await session.list_tools()).tools}
+
+    for name in ("get_alerts", "find_nearby", "get_vehicle_positions"):
+        schema = tools[name].input_schema["properties"]["max_results"]
+        assert schema.get("minimum") == 1, f"{name}.max_results has no minimum"
+    assert tools["find_stop"].input_schema["properties"]["limit"].get("minimum") == 1
+
+
+async def test_a_negative_max_results_is_rejected(base_url):
+    async with http_client(base_url, headers={"X-API-Key": "test-key"}) as client:
+        async with streamable_http_client(f"{base_url}/mcp", http_client=client) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool("get_alerts", {"max_results": -1})
+
+    assert result.is_error is True
+
+
+async def test_sse_transport_completes_a_real_session(base_url):
+    # The SSE transport is advertised in the README, so exercise a whole session
+    # over it rather than only asserting the endpoint's content type.
+    with mock.patch("tfnsw_trip_planner_mcp.auth.TripPlannerClient") as factory:
+        factory.return_value.find_stop.return_value = [make_location()]
+
+        async with sse_client(f"{base_url}/sse", headers={"X-API-Key": "sse-key"}) as (
+            read,
+            write,
+        ):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await session.list_tools()
+                result = await session.call_tool("find_stop", {"query": "Circular Quay"})
+
+    assert {t.name for t in tools.tools} == EXPECTED_TOOLS
+    assert result.is_error is False
+    assert result.structured_content["locations"][0]["name"] == "Circular Quay"
+    # The header must survive the SSE transport's separate POST channel.
+    assert factory.call_args.kwargs["api_key"] == "sse-key"
 
 
 async def test_sse_endpoint_is_mounted(base_url):
