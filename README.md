@@ -112,6 +112,28 @@ Notes:
   content and as structured content) and clients cap a single SSE event at
   1MiB, so an oversized reply fails outright with *"SSE stream ended without a
   response"*.
+- **Journey detail.** `plan_trip`, `plan_trip_from_coordinate` and
+  `plan_cycling_trip` take a `detail` level, because the raw response is mostly
+  map geometry. On a real Sydney-to-Katoomba trip the full response is 1.06MB —
+  over the 1MB tool-result limit, so the call fails outright — and 96% of that
+  is data a model never reads:
+
+  | leg field | share of payload |
+  |---|---|
+  | `coords` (route polyline) | 72% |
+  | `stop_sequence` | 24% |
+  | times, modes, interchanges, durations | 4% |
+
+  | `detail` | includes | same Katoomba trip |
+  |---|---|---|
+  | `summary` (default) | times, modes, interchanges, durations | **39 KB** |
+  | `stops` | + every intermediate stop | 301 KB |
+  | `full` | + route polyline | 1,061 KB |
+
+  Every result reports the level it used, so a model can see it was trimmed and
+  ask for more rather than assuming the data does not exist. `full` only fits
+  when paired with `max_results` of 1–3.
+
 - **`find_stop` takes `limit`, not `max_results`** — deliberately a different
   name, because it bounds the *upstream query* rather than truncating a fetched
   list, so `count` is exact and no bandwidth is wasted.

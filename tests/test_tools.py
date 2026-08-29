@@ -1,12 +1,15 @@
 """Tests for the 10 MCP tools: argument mapping, output shape, error mapping."""
 
+import json
 from datetime import datetime
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 from tfnsw_trip_planner import APIError, NetworkError
-from tfnsw_trip_planner.models import Coordinate, Location
-from tfnsw_trip_planner.models.enums import CyclingProfile, LocationType
+from tfnsw_trip_planner.models import Coordinate, Journey, Leg, Location
+from tfnsw_trip_planner.models.enums import CyclingProfile, LocationType, TransportMode
+from tfnsw_trip_planner.models.stop import Stop
+from tfnsw_trip_planner.models.transport import Transport
 
 from tfnsw_trip_planner_mcp import server
 from tfnsw_trip_planner_mcp.server import _capped, parse_when
@@ -126,7 +129,9 @@ async def test_every_list_tool_returns_the_same_shape(tool_name, ctx, client):
 
     result = await getattr(server, tool_name)(**LIST_TOOL_ARGS[tool_name], ctx=ctx)
 
-    assert set(result) == {"count", "returned", LIST_TOOL_KEYS[tool_name]}
+    # Journey tools additionally report the detail level they applied.
+    assert {"count", "returned", LIST_TOOL_KEYS[tool_name]} <= set(result)
+    assert set(result) - {"detail"} == {"count", "returned", LIST_TOOL_KEYS[tool_name]}
     assert result["count"] == 2
     assert result["returned"] == 2
 
@@ -237,7 +242,9 @@ async def test_plan_trip_wraps_journeys(ctx, client):
 
     result = await server.plan_trip(origin_id="A", destination_id="B", ctx=ctx)
 
-    assert result == {"count": 3, "returned": 3, "journeys": ["j1", "j2", "j3"]}
+    assert result["count"] == 3
+    assert result["returned"] == 3
+    assert result["journeys"] == ["j1", "j2", "j3"]
 
 
 async def test_plan_trip_from_coordinate_forwards_the_coordinate(ctx, client):
@@ -491,3 +498,140 @@ async def test_every_tool_call_closes_its_client(ctx, client):
     await server.find_stop(query="Circular Quay", ctx=ctx)
 
     client.close.assert_called_once()
+
+
+# --------------------------------------------------------------------------
+# Journey detail levels
+# --------------------------------------------------------------------------
+
+
+def make_leg(coord_points=250, stops=30):
+    """A leg shaped like a real one: a long polyline and a full stop sequence."""
+    stop = Stop(
+        id="10101268",
+        name="Katoomba Station",
+        disassembled_name="Katoomba",
+        coord=Coordinate(-33.7127, 150.3119),
+        departure_planned=None,
+        departure_estimated=None,
+        arrival_planned=None,
+        arrival_estimated=None,
+        wheelchair_access=True,
+        properties={},
+    )
+    return Leg(
+        duration=7200,
+        origin=stop,
+        destination=stop,
+        transportation=Transport(
+            id="T1",
+            name="Blue Mountains Line",
+            disassembled_name="BMT",
+            number="BMT",
+            icon_id=1,
+            description="",
+            product={"class": 1},
+            destination_name="Katoomba",
+            mode=TransportMode.TRAIN,
+        ),
+        stop_sequence=[stop] * stops,
+        coords=[Coordinate(-33.7 + i / 1000, 150.3 + i / 1000) for i in range(coord_points)],
+        infos=[],
+        hints=[],
+        properties={},
+        is_realtime=True,
+    )
+
+
+def make_journey(legs=2):
+    return Journey(legs=[make_leg() for _ in range(legs)])
+
+
+JOURNEY_TOOLS = {
+    "plan_trip": {"origin_id": "A", "destination_id": "B"},
+    "plan_trip_from_coordinate": {"latitude": 1.0, "longitude": 2.0, "destination_id": "B"},
+    "plan_cycling_trip": {"origin_id": "A", "destination_id": "B"},
+}
+
+
+@pytest.mark.parametrize("tool_name", sorted(JOURNEY_TOOLS))
+async def test_journeys_omit_route_geometry_by_default(tool_name, ctx, client):
+    # coords is a map-drawing polyline: 72% of a real Katoomba plan_trip
+    # response, which pushed the whole result past the 1MB client limit. A model
+    # answering "how do I get there" never reads it.
+    getattr(client, tool_name).return_value = [make_journey()]
+
+    result = await getattr(server, tool_name)(**JOURNEY_TOOLS[tool_name], ctx=ctx)
+
+    for leg in result["journeys"][0]["legs"]:
+        assert "coords" not in leg
+        assert "stop_sequence" not in leg
+        # The fields that actually answer the question stay.
+        assert leg["duration"] == 7200
+        assert leg["transportation"]["name"] == "Blue Mountains Line"
+        assert leg["origin"]["name"] == "Katoomba Station"
+
+
+@pytest.mark.parametrize("tool_name", sorted(JOURNEY_TOOLS))
+async def test_stops_detail_adds_the_stop_sequence_but_not_geometry(tool_name, ctx, client):
+    getattr(client, tool_name).return_value = [make_journey()]
+
+    result = await getattr(server, tool_name)(**JOURNEY_TOOLS[tool_name], detail="stops", ctx=ctx)
+
+    leg = result["journeys"][0]["legs"][0]
+    assert len(leg["stop_sequence"]) == 30
+    assert "coords" not in leg
+
+
+@pytest.mark.parametrize("tool_name", sorted(JOURNEY_TOOLS))
+async def test_full_detail_keeps_everything(tool_name, ctx, client):
+    getattr(client, tool_name).return_value = [make_journey()]
+
+    result = await getattr(server, tool_name)(**JOURNEY_TOOLS[tool_name], detail="full", ctx=ctx)
+
+    leg = result["journeys"][0]["legs"][0]
+    assert len(leg["coords"]) == 250
+    assert len(leg["stop_sequence"]) == 30
+
+
+async def test_the_result_says_which_detail_level_it_used(ctx, client):
+    # Self-describing, so a model that wants the polyline knows to ask again
+    # rather than concluding the data does not exist.
+    client.plan_trip.return_value = [make_journey()]
+
+    assert (await server.plan_trip(origin_id="A", destination_id="B", ctx=ctx))["detail"] == (
+        "summary"
+    )
+    assert (await server.plan_trip(origin_id="A", destination_id="B", detail="full", ctx=ctx))[
+        "detail"
+    ] == "full"
+
+
+async def test_summary_is_dramatically_smaller_than_full(ctx, client):
+    client.plan_trip.return_value = [make_journey() for _ in range(4)]
+
+    summary = await server.plan_trip(origin_id="A", destination_id="B", ctx=ctx)
+    full = await server.plan_trip(origin_id="A", destination_id="B", detail="full", ctx=ctx)
+
+    assert len(json.dumps(summary)) < len(json.dumps(full)) / 10
+
+
+async def test_journeys_are_capped(ctx, client):
+    client.plan_trip.return_value = [make_journey() for _ in range(9)]
+
+    result = await server.plan_trip(origin_id="A", destination_id="B", max_results=2, ctx=ctx)
+
+    assert result["count"] == 9
+    assert result["returned"] == 2
+
+
+async def test_trimming_does_not_mutate_other_legs(ctx, client):
+    # Pruning walks nested dicts; a bug there could drop fields from only the
+    # first leg and leave the rest inconsistent.
+    client.plan_trip.return_value = [make_journey(legs=3)]
+
+    result = await server.plan_trip(origin_id="A", destination_id="B", ctx=ctx)
+
+    legs = result["journeys"][0]["legs"]
+    assert len(legs) == 3
+    assert all("coords" not in leg for leg in legs)
