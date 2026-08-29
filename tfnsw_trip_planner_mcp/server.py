@@ -15,7 +15,7 @@ import anyio.to_thread
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
-from tfnsw_trip_planner import APIError, NetworkError
+from tfnsw_trip_planner import APIError, NetworkError, TripPlannerClient
 from tfnsw_trip_planner.models.enums import CyclingProfile
 
 from .auth import API_KEY_HEADER, MissingAPIKeyError, client_for
@@ -63,20 +63,13 @@ _LEG_FIELDS_DROPPED: dict[str, tuple[str, ...]] = {
 # A model passing -1 to mean "unlimited" is the case that matters.
 PositiveInt = Annotated[int, Field(ge=1)]
 
-# Verified against the live API: every entry returns 200 with vehicle data.
-# "sydneytrains" is deliberately absent - TfNSW publishes no vehicle position
-# feed for it under any path, and listing it made this server accept a mode that
-# could only ever 404. Bare "lightrail" is absent for a similar reason: it
-# responds 200 but with an empty feed, so it can only mislead.
-VEHICLE_POSITION_MODES = (
-    "buses",
-    "ferries/sydneyferries",
-    "lightrail/cbdandsoutheast",
-    "lightrail/newcastle",
-    "lightrail/parramatta",
-    "metro",
-    "nswtrains",
-)
+# Taken from the library rather than restated here, so the two cannot drift.
+# That drift is exactly what broke this before: a hand-written list included
+# "sydneytrains", which 404s on the v1 endpoint the library used to hardcode,
+# so a feed that does exist was first advertised-but-broken and then removed
+# outright. tfnsw-trip-planner 1.4.0 routes the superseded feeds (Sydney Trains
+# and Inner West Light Rail) to the v2 endpoint that actually serves them.
+VEHICLE_POSITION_MODES = TripPlannerClient.VEHICLE_POSITION_MODES
 
 
 def parse_when(value: str | None) -> datetime | None:
@@ -523,11 +516,10 @@ async def get_vehicle_positions(
     true feed size and `returned` is how many are included.
 
     Args:
-        mode: Which feed to read. One of "buses", "metro", "nswtrains",
-            "ferries/sydneyferries", "lightrail/cbdandsoutheast",
-            "lightrail/newcastle", "lightrail/parramatta". Note there is no
-            Sydney Trains vehicle position feed; use get_departures for
-            suburban train times.
+        mode: Which feed to read. One of "buses", "sydneytrains", "metro",
+            "nswtrains", "ferries/sydneyferries", "lightrail/cbdandsoutheast",
+            "lightrail/innerwest", "lightrail/newcastle",
+            "lightrail/parramatta".
         max_results: Maximum vehicles to return.
     """
     if mode not in VEHICLE_POSITION_MODES:

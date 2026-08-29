@@ -994,14 +994,14 @@ wheels = [
 
 [[package]]
 name = "tfnsw-trip-planner"
-version = "1.3.1"
+version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/93/f0/ab6575064be7bde898df4b7981c0f2d2ce671ea3d8da1758f747dc9d90fb/tfnsw_trip_planner-1.3.1.tar.gz", hash = "sha256:8b14d7502c5ca85c0b4b942e2600a6dddd7fee59d969edf1bb0b489b927e0741", size = 25225, upload-time = "2026-06-08T00:41:33.883Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/69/ac/e4e4717dc4353cae51db7b35b7bc55e3e7b576ef57e9c73359758ef2f319/tfnsw_trip_planner-1.4.0.tar.gz", hash = "sha256:afb426c7efc994051b9ddef45874627aac7d2a13836337106af4f9ecb4b4779b", size = 28228, upload-time = "2026-08-29T12:54:11.108Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7e/13/826d444f47fd1564dfd49dfbe7ff2ae7eca9efe4395077c8464e7379e486/tfnsw_trip_planner-1.3.1-py3-none-any.whl", hash = "sha256:0f9f6624e311c0c45763c4b5d4987d2c13e1076cbd4a5d1435604d836d440bb7", size = 23274, upload-time = "2026-06-08T00:41:32.441Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/cf/11412502b2099ac1ed54fe692a7701e3e4c872a241fcdefc0bbe1576bc2d/tfnsw_trip_planner-1.4.0-py3-none-any.whl", hash = "sha256:9fe3b205c05b583fbc18136909bcf497b04e6fa16b1fd2742a58dbc5b3a9655c", size = 23871, upload-time = "2026-08-29T12:54:09.709Z" },
 ]
 
 [package.optional-dependencies]
@@ -1032,7 +1032,7 @@ dev = [
 requires-dist = [
     { name = "mcp", specifier = ">=1.9.0" },
     { name = "starlette", specifier = ">=0.37.0" },
-    { name = "tfnsw-trip-planner", extras = ["realtime"], specifier = ">=1.3.1" },
+    { name = "tfnsw-trip-planner", extras = ["realtime"], specifier = ">=1.4.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30.0" },
 ]
 

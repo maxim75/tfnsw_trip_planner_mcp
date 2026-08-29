@@ -417,19 +417,27 @@ async def test_get_vehicle_positions_returns_everything_when_under_the_cap(ctx, 
     assert result == {"count": 3, "returned": 3, "vehicles": [1, 2, 3]}
 
 
-@pytest.mark.parametrize("bad_mode", ["trains", "sydneytrains", "ferries", "lightrail"])
+@pytest.mark.parametrize("bad_mode", ["trains", "ferries", "lightrail", "regionbuses"])
 async def test_get_vehicle_positions_rejects_an_unknown_feed(bad_mode, ctx, client):
     # An unknown mode otherwise reaches TfNSW and comes back as an opaque 404;
-    # naming the valid feeds lets the model correct itself.
-    #
-    # "sydneytrains" is here because it was wrongly advertised once: TfNSW
-    # publishes no vehicle position feed for it, so every call 404'd. "ferries"
-    # and "lightrail" are the other plausible-but-wrong guesses.
+    # naming the valid feeds lets the model correct itself. These are the
+    # plausible-but-wrong guesses: bare "ferries" and "lightrail" need a
+    # sub-feed, and "trains" is neither sydneytrains nor nswtrains.
     with pytest.raises(ToolError) as excinfo:
         await server.get_vehicle_positions(mode=bad_mode, ctx=ctx)
 
     assert "buses" in str(excinfo.value), "the error should list the valid feeds"
     client.vehicle_positions.assert_not_called()
+
+
+async def test_sydneytrains_is_accepted(ctx, client):
+    # Regression: this was advertised, then wrongly removed as non-existent.
+    # It is real, on the v2 endpoint that tfnsw-trip-planner 1.4.0 routes to.
+    client.vehicle_positions.return_value = []
+
+    await server.get_vehicle_positions(mode="sydneytrains", ctx=ctx)
+
+    client.vehicle_positions.assert_called_once_with(mode="sydneytrains")
 
 
 @pytest.mark.parametrize("mode", server.VEHICLE_POSITION_MODES)

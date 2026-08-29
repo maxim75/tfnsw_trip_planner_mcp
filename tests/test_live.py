@@ -87,24 +87,25 @@ async def test_find_stop_returns_real_sydney_stops(live_server):
     assert all(loc["id"] for loc in payload["locations"])
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Upstream bug in tfnsw-trip-planner 1.3.1: Location.from_dict reads the "
-        "name only from properties.STOP_NAME_WITH_PLACE, which the coordinate API "
-        "returns but stop_finder does not. stop_finder puts it at the top level as "
-        "data['name'] ('Circular Quay, Sydney'), so every find_stop/best_stop/"
-        "find_stop_by_id/find_nearby result comes back with name=''. The fix is a "
-        "top-level fallback in the library, matching how `id` is already handled."
-    ),
-    strict=True,
-)
 async def test_find_stop_results_carry_names(live_server):
+    # Was an xfail: tfnsw-trip-planner <=1.3.1 read the name only from
+    # properties.STOP_NAME_WITH_PLACE, which stop_finder does not send, so every
+    # result came back with name="". Fixed in 1.4.0 by falling back to the
+    # top-level data["name"]. Without names a model cannot tell results apart.
     async with real_session(live_server) as session:
         result = await session.call_tool("find_stop", {"query": "Circular Quay"})
 
     payload = result.structured_content
-    # Without names a model cannot tell 7 results apart, so this matters.
     assert any("Circular Quay" in loc["name"] for loc in payload["locations"])
+
+
+async def test_best_stop_resolves_a_named_stop(live_server):
+    async with real_session(live_server) as session:
+        result = await session.call_tool("best_stop", {"query": "Katoomba Station"})
+
+    location = result.structured_content["location"]
+    assert location["id"]
+    assert "Katoomba" in location["name"]
 
 
 async def test_departures_for_a_resolved_stop(live_server):

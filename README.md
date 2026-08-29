@@ -146,11 +146,15 @@ Notes:
 - **`get_vehicle_positions`** reads the GTFS-Realtime feed, which is a *separate*
   product on the Open Data portal — your key must be subscribed to it as well.
   An unrecognised `mode` is rejected with the list of valid feeds rather than
-  being passed through to an opaque upstream 404. The seven valid feeds are
-  `buses`, `metro`, `nswtrains`, `ferries/sydneyferries`,
-  `lightrail/cbdandsoutheast`, `lightrail/newcastle` and `lightrail/parramatta`,
-  each verified live. **There is no Sydney Trains vehicle-position feed** —
-  TfNSW does not publish one; use `get_departures` for suburban train times.
+  being passed through to an opaque upstream 404. The nine valid feeds are
+  `buses`, `sydneytrains`, `metro`, `nswtrains`, `ferries/sydneyferries`,
+  `lightrail/cbdandsoutheast`, `lightrail/innerwest`, `lightrail/newcastle` and
+  `lightrail/parramatta`.
+
+  The list is taken from the library rather than restated here, so the two
+  cannot drift. TfNSW serves `sydneytrains` and `lightrail/innerwest` from a
+  **v2** endpoint and the rest from v1; `tfnsw-trip-planner` 1.4.0 routes each
+  feed to the version that actually serves it.
 
 Results are returned as structured JSON. Every list-returning tool answers with
 the same shape, so `returned` is always present and `count` is always the true
@@ -162,21 +166,6 @@ total before any capping:
 
 Single lookups (`find_stop_by_id`, `best_stop`) return `{"location": {...}}`,
 or `{"location": null}` when nothing matches.
-
-### Known limitation: empty location names
-
-`find_stop`, `find_stop_by_id`, `best_stop` and `find_nearby` return correct
-stop **IDs** but an empty `name`. This is an upstream bug in
-`tfnsw-trip-planner` 1.3.1: `Location.from_dict` reads the name only from
-`properties.STOP_NAME_WITH_PLACE`, which the coordinate API supplies but the
-stop-finder API does not — the latter returns it at the top level as
-`data["name"]` (`"Circular Quay, Sydney"`). The name is discarded during
-parsing, so this server cannot recover it downstream; the fix belongs in the
-library, mirroring the fallback its `id` field already has.
-
-`get_departures` is unaffected — it uses a different model that parses names
-correctly. `tests/test_live.py` carries an `xfail` test that will flip to
-passing once the library is fixed.
 
 ## Running it
 
