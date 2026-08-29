@@ -17,6 +17,7 @@ import uvicorn
 from mcp.client import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from tfnsw_trip_planner_mcp import server
 from tfnsw_trip_planner_mcp.app import create_app
 
 pytestmark = [
@@ -148,3 +149,22 @@ async def test_a_bad_key_surfaces_the_upstream_error(live_server):
 
     assert result.is_error is True
     assert "definitely-not-valid" not in result.content[0].text
+
+
+@pytest.mark.parametrize("mode", server.VEHICLE_POSITION_MODES)
+async def test_every_advertised_vehicle_feed_actually_exists(live_server, mode):
+    """Regression: "sydneytrains" was advertised but 404s at TfNSW.
+
+    The tool rejects unknown feeds by consulting VEHICLE_POSITION_MODES, so a
+    wrong entry there is worse than no check at all — it waves through a mode
+    that can only fail. Only a live call can tell the two apart.
+    """
+    async with real_session(live_server) as session:
+        result = await session.call_tool("get_vehicle_positions", {"mode": mode, "max_results": 1})
+
+    if result.is_error:
+        message = result.content[0].text
+        if "403" in message:
+            pytest.skip(f"key is not subscribed to the vehicle positions feed: {message[:80]}")
+        pytest.fail(f"advertised feed {mode!r} failed: {message[:200]}")
+    assert result.structured_content["count"] >= 0
