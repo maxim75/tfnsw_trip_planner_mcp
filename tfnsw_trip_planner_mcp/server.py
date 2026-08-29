@@ -63,6 +63,11 @@ _LEG_FIELDS_DROPPED: dict[str, tuple[str, ...]] = {
 # A model passing -1 to mean "unlimited" is the case that matters.
 PositiveInt = Annotated[int, Field(ge=1)]
 
+# Verified against the live API: every entry returns 200 with vehicle data.
+# "sydneytrains" is deliberately absent - TfNSW publishes no vehicle position
+# feed for it under any path, and listing it made this server accept a mode that
+# could only ever 404. Bare "lightrail" is absent for a similar reason: it
+# responds 200 but with an empty feed, so it can only mislead.
 VEHICLE_POSITION_MODES = (
     "buses",
     "ferries/sydneyferries",
@@ -71,7 +76,6 @@ VEHICLE_POSITION_MODES = (
     "lightrail/parramatta",
     "metro",
     "nswtrains",
-    "sydneytrains",
 )
 
 
@@ -519,9 +523,11 @@ async def get_vehicle_positions(
     true feed size and `returned` is how many are included.
 
     Args:
-        mode: Which feed to read. One of "buses", "metro", "sydneytrains",
-            "nswtrains", "ferries/sydneyferries", "lightrail/cbdandsoutheast",
-            "lightrail/newcastle", "lightrail/parramatta".
+        mode: Which feed to read. One of "buses", "metro", "nswtrains",
+            "ferries/sydneyferries", "lightrail/cbdandsoutheast",
+            "lightrail/newcastle", "lightrail/parramatta". Note there is no
+            Sydney Trains vehicle position feed; use get_departures for
+            suburban train times.
         max_results: Maximum vehicles to return.
     """
     if mode not in VEHICLE_POSITION_MODES:

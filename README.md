@@ -146,7 +146,11 @@ Notes:
 - **`get_vehicle_positions`** reads the GTFS-Realtime feed, which is a *separate*
   product on the Open Data portal — your key must be subscribed to it as well.
   An unrecognised `mode` is rejected with the list of valid feeds rather than
-  being passed through to an opaque upstream 404.
+  being passed through to an opaque upstream 404. The seven valid feeds are
+  `buses`, `metro`, `nswtrains`, `ferries/sydneyferries`,
+  `lightrail/cbdandsoutheast`, `lightrail/newcastle` and `lightrail/parramatta`,
+  each verified live. **There is no Sydney Trains vehicle-position feed** —
+  TfNSW does not publish one; use `get_departures` for suburban train times.
 
 Results are returned as structured JSON. Every list-returning tool answers with
 the same shape, so `returned` is always present and `count` is always the true

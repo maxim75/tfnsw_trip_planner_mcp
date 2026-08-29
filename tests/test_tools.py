@@ -417,13 +417,18 @@ async def test_get_vehicle_positions_returns_everything_when_under_the_cap(ctx, 
     assert result == {"count": 3, "returned": 3, "vehicles": [1, 2, 3]}
 
 
-async def test_get_vehicle_positions_rejects_an_unknown_feed(ctx, client):
+@pytest.mark.parametrize("bad_mode", ["trains", "sydneytrains", "ferries", "lightrail"])
+async def test_get_vehicle_positions_rejects_an_unknown_feed(bad_mode, ctx, client):
     # An unknown mode otherwise reaches TfNSW and comes back as an opaque 404;
     # naming the valid feeds lets the model correct itself.
+    #
+    # "sydneytrains" is here because it was wrongly advertised once: TfNSW
+    # publishes no vehicle position feed for it, so every call 404'd. "ferries"
+    # and "lightrail" are the other plausible-but-wrong guesses.
     with pytest.raises(ToolError) as excinfo:
-        await server.get_vehicle_positions(mode="trains", ctx=ctx)
+        await server.get_vehicle_positions(mode=bad_mode, ctx=ctx)
 
-    assert "sydneytrains" in str(excinfo.value)
+    assert "buses" in str(excinfo.value), "the error should list the valid feeds"
     client.vehicle_positions.assert_not_called()
 
 
