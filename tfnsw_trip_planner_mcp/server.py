@@ -45,6 +45,20 @@ mcp = MCPServer(
 
 CyclingProfileName = Literal["EASIER", "MODERATE", "MORE_DIRECT"]
 
+JourneyDetail = Literal["summary", "stops", "full"]
+
+# Which leg fields each detail level drops. `coords` is the route polyline the
+# API returns for drawing a map: on a real Sydney-to-Katoomba plan_trip it was
+# 72% of a 1.06MB response, which exceeded the client's 1MB tool-result limit
+# outright. `stop_sequence` (every intermediate stop) was another 24%. Together
+# they are 96% of the payload and neither is needed to answer "how do I get
+# there", so the default drops both and a caller opts back in.
+_LEG_FIELDS_DROPPED: dict[str, tuple[str, ...]] = {
+    "summary": ("coords", "stop_sequence"),
+    "stops": ("coords",),
+    "full": (),
+}
+
 # Rejects a nonsensical limit at schema validation, before it can reach a slice.
 # A model passing -1 to mean "unlimited" is the case that matters.
 PositiveInt = Annotated[int, Field(ge=1)]
@@ -122,6 +136,33 @@ def _capped(items: list[Any], max_results: int | None, key: str) -> dict[str, An
         # second line of defence, not the only one.
         capped = items[: max(1, max_results)]
     return {"count": len(items), "returned": len(capped), key: to_jsonable(capped)}
+
+
+def _journeys_result(
+    journeys: list[Any], max_results: int | None, detail: JourneyDetail
+) -> dict[str, Any]:
+    """Wrap journeys, trimming each leg to the requested level of detail.
+
+    Carries `detail` back to the caller so a model that wants the geometry can
+    see the result was trimmed and ask again, rather than concluding the data
+    does not exist.
+    """
+    result = _capped(journeys, max_results, "journeys")
+    dropped = _LEG_FIELDS_DROPPED[detail]
+    if dropped:
+        for journey in result["journeys"]:
+            # Serialized journeys are dicts of dicts, but trimming is a
+            # presentation concern and must never be the thing that fails a
+            # call, so anything unexpected is left untouched rather than raising.
+            if not isinstance(journey, dict):
+                continue
+            for leg in journey.get("legs") or ():
+                if not isinstance(leg, dict):
+                    continue
+                for field in dropped:
+                    leg.pop(field, None)
+    result["detail"] = detail
+    return result
 
 
 def _redact(ctx: Context, message: str) -> str:
@@ -211,6 +252,8 @@ async def plan_trip(
     destination_type: str = "stop",
     realtime: bool = True,
     wheelchair: bool = False,
+    detail: JourneyDetail = "summary",
+    max_results: PositiveInt = 5,
 ) -> dict[str, Any]:
     """Plan a public transport journey between two stops.
 
@@ -228,6 +271,14 @@ async def plan_trip(
         destination_type: Kind of the destination ID.
         realtime: Include live delay information.
         wheelchair: Return only wheelchair-accessible journeys.
+        detail: How much per-leg data to return. "summary" (default) omits the
+            route polyline and the intermediate stop list, keeping times, modes,
+            interchanges and durations — enough to answer almost any trip
+            question at a fraction of the size. "stops" adds the intermediate
+            stops. "full" adds the map polyline too and is very large — pair it
+            with max_results=1 or 2, or a long journey will exceed the client's
+            tool-result limit and the call will fail.
+        max_results: Maximum journeys to return.
     """
     journeys = await _call(
         ctx,
@@ -241,7 +292,7 @@ async def plan_trip(
         realtime=realtime,
         wheelchair=wheelchair,
     )
-    return _capped(journeys, None, "journeys")
+    return _journeys_result(journeys, max_results, detail)
 
 
 @mcp.tool()
@@ -254,6 +305,8 @@ async def plan_trip_from_coordinate(
     arrive_by: bool = False,
     realtime: bool = True,
     wheelchair: bool = False,
+    detail: JourneyDetail = "summary",
+    max_results: PositiveInt = 5,
 ) -> dict[str, Any]:
     """Plan a journey starting from a GPS coordinate rather than a stop.
 
@@ -268,6 +321,14 @@ async def plan_trip_from_coordinate(
         arrive_by: Treat `when` as the desired arrival time.
         realtime: Include live delay information.
         wheelchair: Return only wheelchair-accessible journeys.
+        detail: How much per-leg data to return. "summary" (default) omits the
+            route polyline and the intermediate stop list, keeping times, modes,
+            interchanges and durations — enough to answer almost any trip
+            question at a fraction of the size. "stops" adds the intermediate
+            stops. "full" adds the map polyline too and is very large — pair it
+            with max_results=1 or 2, or a long journey will exceed the client's
+            tool-result limit and the call will fail.
+        max_results: Maximum journeys to return.
     """
     journeys = await _call(
         ctx,
@@ -280,7 +341,7 @@ async def plan_trip_from_coordinate(
         realtime=realtime,
         wheelchair=wheelchair,
     )
-    return _capped(journeys, None, "journeys")
+    return _journeys_result(journeys, max_results, detail)
 
 
 @mcp.tool()
@@ -293,6 +354,8 @@ async def plan_cycling_trip(
     bike_only: bool = True,
     max_time_minutes: int = 240,
     cycle_speed: int = 16,
+    detail: JourneyDetail = "summary",
+    max_results: PositiveInt = 5,
 ) -> dict[str, Any]:
     """Plan a cycling route, optionally combined with public transport.
 
@@ -305,6 +368,14 @@ async def plan_cycling_trip(
         bike_only: Cycle the whole way. Set false to allow mixed bike + transit.
         max_time_minutes: Reject routes longer than this.
         cycle_speed: Assumed cycling speed in km/h.
+        detail: How much per-leg data to return. "summary" (default) omits the
+            route polyline and the intermediate stop list, keeping times, modes,
+            interchanges and durations — enough to answer almost any trip
+            question at a fraction of the size. "stops" adds the intermediate
+            stops. "full" adds the map polyline too and is very large — pair it
+            with max_results=1 or 2, or a long journey will exceed the client's
+            tool-result limit and the call will fail.
+        max_results: Maximum journeys to return.
     """
     journeys = await _call(
         ctx,
@@ -317,7 +388,7 @@ async def plan_cycling_trip(
         max_time_minutes=max_time_minutes,
         cycle_speed=cycle_speed,
     )
-    return _capped(journeys, None, "journeys")
+    return _journeys_result(journeys, max_results, detail)
 
 
 # --------------------------------------------------------------------------
