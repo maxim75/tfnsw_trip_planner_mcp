@@ -1,0 +1,28 @@
+# Deployment target: Coolify (Docker Compose resource).
+#
+# There are deliberately NO secrets here. Each caller sends their own TfNSW
+# Open Data API key in the X-API-Key header on every request, so the server
+# holds no credentials of its own.
+
+services:
+  tfnsw-trip-planner-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tfnsw-trip-planner-mcp:latest
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 6401
+    ports:
+      - "6401:6401"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request;urllib.request.urlopen("http://127.0.0.1:6401/health").read()
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

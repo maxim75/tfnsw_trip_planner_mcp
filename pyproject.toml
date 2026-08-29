@@ -1,0 +1,49 @@
+[project]
+name = "tfnsw-trip-planner-mcp"
+version = "0.1.0"
+description = "MCP server exposing the Transport for NSW Trip Planner APIs"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.9.0",
+    "tfnsw-trip-planner[realtime]>=1.3.1",
+    "starlette>=0.37.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[project.scripts]
+tfnsw-trip-planner-mcp = "tfnsw_trip_planner_mcp.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "ruff>=0.6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tfnsw_trip_planner_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "live: hits the real TfNSW API; requires TFNSW_API_KEY (deselect with '-m \"not live\"')",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    # Naive datetimes are the subject under test: the library reads a value with
+    # no offset as Sydney local time, and the tools must pass it through as-is.
+    "DTZ001",
+    # The MCP client transport is a stack of async context managers. One `async
+    # with` per line stays readable; collapsing them produces worse lines.
+    "SIM117",
+]
