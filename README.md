@@ -228,6 +228,17 @@ uv sync
 uv run python -m tfnsw_trip_planner_mcp
 ```
 
+### Stdio (for local process-spawning clients and directory scanners)
+
+```bash
+MCP_TRANSPORT=stdio uv run python -m tfnsw_trip_planner_mcp
+```
+
+There are no HTTP headers under stdio, so every tool call fails with a missing-API-key
+error — this mode only serves the `initialize`/`tools-list` handshake (e.g. for MCP
+directory scanners that spawn the container and speak stdio rather than HTTP). The
+default deployment above (Docker/Coolify, `/mcp` and `/sse`) is unaffected either way.
+
 ### Tests
 
 The default suite is fully offline — the library client is mocked, so no key is
