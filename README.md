@@ -262,3 +262,5 @@ pull requests never receive the secret, so they always skip.
 | `auth.py` | `X-API-Key` extraction and per-call client lifecycle |
 | `serialization.py` | Library dataclasses → JSON-safe structures |
 | `app.py` | ASGI app wiring both transports plus `/health` |
+
+[![TfNSW Trip Planner MCP Server MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/maxim75/tfnsw_trip_planner_mcp/badges/card.svg)](https://glama.ai/mcp/servers/maxim75/tfnsw_trip_planner_mcp)
