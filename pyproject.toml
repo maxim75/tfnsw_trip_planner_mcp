@@ -3,6 +3,7 @@ name = "tfnsw-trip-planner-mcp"
 version = "0.1.0"
 description = "MCP server exposing the Transport for NSW Trip Planner APIs"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=1.9.0",
