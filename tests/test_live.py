@@ -5,6 +5,7 @@ Skipped unless TFNSW_API_KEY is set, so the default suite stays offline:
     TFNSW_API_KEY=<key> uv run pytest -m live
 """
 
+import json
 import os
 import socket
 import threading
@@ -134,6 +135,72 @@ async def test_plan_trip_between_two_real_stops(live_server):
     payload = result.structured_content
     assert payload["count"] > 0
     assert payload["journeys"][0]["legs"], "a journey should have at least one leg"
+
+
+async def test_plan_trip_resolves_two_addresses_in_a_single_call(live_server):
+    """The whole point of taking place names: one call, not three.
+
+    Also the regression test for origin_type. These addresses resolve to
+    `streetID:...` IDs of type "singlehouse"; with the old type_origin="stop"
+    default TfNSW returns zero journeys for them, so this asks for the exact
+    trip that used to fail silently.
+    """
+    async with real_session(live_server) as session:
+        result = await session.call_tool(
+            "plan_trip",
+            {
+                "origin": "100 Harris Street Pyrmont",
+                "destination": "32 Geelong Rd Engadine",
+                "detail": "answer",
+            },
+        )
+
+    assert result.is_error is False, result.content[0].text
+    payload = result.structured_content
+    assert payload["count"] > 0, "an address-to-address trip must return journeys"
+    # The names were resolved server-side, and the result says what they matched.
+    assert "Harris St" in payload["origin"]["name"]
+    assert "Geelong Rd" in payload["destination"]["name"]
+    # detail="answer" answers the question outright.
+    journey = payload["journeys"][0]
+    assert journey["arrival"] and journey["duration_min"] > 0
+    assert "legs" not in journey
+
+
+async def test_the_live_payload_carries_no_raw_upstream_property_keys(live_server):
+    """Guards the allowlist against a real response, not a fixture.
+
+    A blocklist would let any of these through the moment TfNSW sends them; on a
+    real trip they were 28% of the payload.
+    """
+    async with real_session(live_server) as session:
+        result = await session.call_tool(
+            "plan_trip",
+            {"origin": "Circular Quay", "destination": "Bondi Junction"},
+        )
+
+    assert result.is_error is False, result.content[0].text
+    blob = json.dumps(result.structured_content)
+    for junk in ("accessArray", "AREA_NIVEAU_DIVA", "areaGid", "pbyb", "stoppingPointPlanned"):
+        assert junk not in blob, f"{junk} reached the model"
+
+
+async def test_a_nonsense_place_name_is_refused_rather_than_guessed(live_server):
+    """The risk that comes with resolving names server-side.
+
+    TfNSW's stop finder practically never returns nothing: this query really
+    does resolve to "Iceton Pl, Yass" at match_quality 108. Planning a trip from
+    Yass because someone typed nonsense is far worse than an error, so the
+    server refuses anything below the quality floor and names the candidate.
+    """
+    async with real_session(live_server) as session:
+        result = await session.call_tool(
+            "plan_trip",
+            {"origin": "Zzzqqxnowhere Placeton", "destination": "Circular Quay"},
+        )
+
+    assert result.is_error is True
+    assert "Zzzqqxnowhere" in result.content[0].text
 
 
 async def test_alerts_endpoint_answers(live_server):

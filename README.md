@@ -87,15 +87,16 @@ For a client that only speaks the older transport, point it at `/sse` and pass
 
 ## Tools
 
-Stops are addressed by numeric ID, so resolve a name with `find_stop` or
-`best_stop` first, then pass the ID onwards.
+`plan_trip` takes plain place names and resolves them itself. The other tools
+are addressed by numeric stop ID, so resolve a name with `find_stop` or
+`best_stop` first and pass the ID onwards.
 
 | Tool | What it does |
 |---|---|
 | `find_stop` | Search stops, wharves, POIs and addresses by name |
 | `find_stop_by_id` | Look up one stop by its numeric ID |
 | `best_stop` | Return only the single best-matching location for a name |
-| `plan_trip` | Plan a journey between two stop IDs |
+| `plan_trip` | Plan a journey between two place names or stop IDs |
 | `plan_trip_from_coordinate` | Plan a journey starting from a GPS coordinate |
 | `plan_cycling_trip` | Plan a cycling route, optionally mixed with transit |
 | `get_departures` | Live departure board for a stop or platform |
@@ -118,27 +119,63 @@ Notes:
   content and as structured content) and clients cap a single SSE event at
   1MiB, so an oversized reply fails outright with *"SSE stream ended without a
   response"*.
-- **Journey detail.** `plan_trip`, `plan_trip_from_coordinate` and
-  `plan_cycling_trip` take a `detail` level, because the raw response is mostly
-  map geometry. On a real Sydney-to-Katoomba trip the full response is 1.06MB —
-  over the 1MB tool-result limit, so the call fails outright — and 96% of that
-  is data a model never reads:
+- **Place names.** `plan_trip` accepts `origin`/`destination` as free text
+  ("100 Harris Street Pyrmont", "Bondi Junction") and resolves them server-side,
+  so a model does not spend two `best_stop` round trips before planning can
+  start. Pass `origin_id`/`destination_id` instead when you already hold an ID —
+  giving both for the same end is an error rather than a silent preference. A
+  resolved result echoes what each name matched:
 
-  | leg field | share of payload |
-  |---|---|
-  | `coords` (route polyline) | 72% |
-  | `stop_sequence` | 24% |
-  | times, modes, interchanges, durations | 4% |
+  ```json
+  {"origin": {"id": "...", "name": "100 Harris St, Pyrmont"}}
+  ```
 
-  | `detail` | includes | same Katoomba trip |
+  Resolution refuses a weak match rather than guessing. TfNSW's stop finder
+  practically never returns nothing — it returns its nearest guess with a score,
+  and `"Zzzqqxnowhere Placeton"` really does resolve to *Iceton Pl, Yass*.
+  Measured on the live API, real places score 250 (street addresses) to 996
+  (stations) while nonsense scores 47–154, so anything under 200 is rejected
+  with an error naming the candidate it declined to use.
+
+- **`origin_type` defaults to `"any"`, not `"stop"`.** An address resolves to a
+  `streetID:...` ID of type `singlehouse`, and planning it with `type_origin=stop`
+  returns **zero journeys** — verified against the live API. The old `"stop"`
+  default silently failed every address-to-address trip.
+
+- **Journey detail.** The journey tools take a `detail` level, because the raw
+  response is overwhelmingly data a model never reads. Journey totals
+  (`departure`, `arrival`, `duration_min`, `changes`, `via`) are always present,
+  so the commonest questions need no leg data at all.
+
+  | `detail` | includes | real Pyrmont → Engadine trip |
   |---|---|---|
-  | `summary` (default) | times, modes, interchanges, durations | **39 KB** |
-  | `stops` | + every intermediate stop | 301 KB |
-  | `full` | + route polyline | 1,061 KB |
+  | `answer` | totals only | **1.4 KB** |
+  | `summary` (default) | + legs: times, route, platform, alerts | 11.4 KB |
+  | `stops` | + intermediate stop names | — |
+  | `full` | + route polyline | — |
 
   Every result reports the level it used, so a model can see it was trimmed and
   ask for more rather than assuming the data does not exist. `full` only fits
   when paired with `max_results` of 1–3.
+
+- **Legs are built from an allowlist**, not by dropping known-bad fields. The
+  old blocklist removed `coords` and `stop_sequence` and passed everything else
+  through, including the raw upstream `properties` bag — lift equipment heights,
+  `AREA_NIVEAU_DIVA`, `areaGid`, `pbyb`, and the platform name repeated under
+  three separate keys. On a real trip that passthrough was 28% of the payload.
+  An allowlist cannot regress that way when TfNSW adds a field. Also:
+
+  - the four planned/estimated time fields collapse to the time that will
+    actually happen, plus `scheduled_*` **only** when there is a real delay
+    (20 of 22 timed stops on a real trip had the two exactly equal);
+  - null times, empty alert lists and the empty `transportation` block that
+    every walking leg carries are omitted rather than serialized;
+  - stop IDs are echoed for chaining only when they are real stop IDs, not
+    129-byte composite `streetID:...` blobs that no other tool accepts.
+
+  Together with the resolution above, the question *"when do I arrive at 32
+  Geelong Rd if I leave now from 100 Harris Street Pyrmont"* went from **3 calls
+  and ~10,800 tokens to 1 call and ~356 tokens** (`detail="answer"`).
 
 - **`find_stop` takes `limit`, not `max_results`** — deliberately a different
   name, because it bounds the *upstream query* rather than truncating a fetched

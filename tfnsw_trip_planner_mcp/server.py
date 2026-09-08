@@ -29,9 +29,18 @@ Transport for NSW Open Data APIs.
 
 Every request must carry a TfNSW API key in the {API_KEY_HEADER} HTTP header.
 
-Stops are addressed by numeric ID, not by name. To answer a question about a
-named place, call find_stop or best_stop first to resolve the name to an ID,
-then pass that ID to plan_trip or get_departures.
+To plan a journey, call plan_trip with plain place names — origin="100 Harris
+Street Pyrmont", destination="Bondi Junction". It resolves them itself, so do
+NOT call find_stop or best_stop first; that costs two extra round trips and
+answers nothing plan_trip cannot.
+
+Use find_stop or best_stop only when the caller wants to see the candidate
+matches for an ambiguous name, or when you need a stop ID for get_departures,
+which does still take an ID.
+
+plan_trip defaults to detail="summary". For "when do I arrive" or "how long does
+it take", pass detail="answer" instead — it returns the times, duration and
+number of changes without any of the per-leg data.
 
 All times are Australia/Sydney local time.
 """
@@ -45,19 +54,25 @@ mcp = MCPServer(
 
 CyclingProfileName = Literal["EASIER", "MODERATE", "MORE_DIRECT"]
 
-JourneyDetail = Literal["summary", "stops", "full"]
+JourneyDetail = Literal["answer", "summary", "stops", "full"]
 
-# Which leg fields each detail level drops. `coords` is the route polyline the
-# API returns for drawing a map: on a real Sydney-to-Katoomba plan_trip it was
-# 72% of a 1.06MB response, which exceeded the client's 1MB tool-result limit
-# outright. `stop_sequence` (every intermediate stop) was another 24%. Together
-# they are 96% of the payload and neither is needed to answer "how do I get
-# there", so the default drops both and a caller opts back in.
-_LEG_FIELDS_DROPPED: dict[str, tuple[str, ...]] = {
-    "summary": ("coords", "stop_sequence"),
-    "stops": ("coords",),
-    "full": (),
-}
+# Modes that are not a service you board, so they never count as an interchange.
+_NON_TRANSIT_MODES = frozenset({"WALK", "WALK_ALT", "CYCLE"})
+
+# The upstream property bag repeats the platform under three keys. Read the
+# first one that is present and drop the rest.
+_PLATFORM_KEYS = ("platformName", "plannedPlatformName", "stoppingPointPlanned")
+
+# Below this, a resolved place name is a guess rather than a match, and planning
+# from it would answer a question nobody asked. TfNSW's stop finder practically
+# never returns nothing — it returns its nearest guess with a score — so without
+# a floor here, resolving names server-side would silently plan the wrong trip.
+# Measured against the live API: real places score 250 (street addresses, which
+# are uniformly 250) up to 996 (stations), while nonsense queries score 47-154
+# ("Zzzqqxnowhere Placeton" resolves to "Iceton Pl, Yass" at 108). 200 sits in
+# the empty band between the two, so it rejects guesses without rejecting the
+# address lookups that matter most.
+_MIN_MATCH_QUALITY = 200
 
 # Rejects a nonsensical limit at schema validation, before it can reach a slice.
 # A model passing -1 to mean "unlimited" is the case that matters.
@@ -90,14 +105,20 @@ def parse_when(value: str | None) -> datetime | None:
         ) from None
 
 
-async def _call(ctx: Context, method: str, **kwargs: Any) -> Any:
-    """Run ``client.<method>(**kwargs)`` for the caller, off the event loop."""
+async def _run(ctx: Context, work: Any) -> Any:
+    """Run ``work(client)`` for the caller, off the event loop.
+
+    Takes a callable rather than a method name so one tool can make several
+    library calls against a *single* client — `plan_trip` resolving two place
+    names before planning is the case that matters. Doing that here rather than
+    making the model call `best_stop` twice turns three round trips into one,
+    and pays the client-construction cost once instead of three times.
+    """
     try:
         with client_for(ctx) as client:
-            bound = functools.partial(getattr(client, method), **kwargs)
             # The library is synchronous `requests`; a slow TfNSW response must
             # not block the event loop and stall every other in-flight call.
-            return await anyio.to_thread.run_sync(bound)
+            return await anyio.to_thread.run_sync(functools.partial(work, client))
     except MissingAPIKeyError as exc:
         raise ToolError(str(exc)) from None
     except APIError as exc:
@@ -106,6 +127,11 @@ async def _call(ctx: Context, method: str, **kwargs: Any) -> Any:
         raise ToolError(f"Could not reach the TfNSW API: {_redact(ctx, str(exc))}") from None
     except ImportError as exc:
         raise ToolError(str(exc)) from None
+
+
+async def _call(ctx: Context, method: str, **kwargs: Any) -> Any:
+    """Run ``client.<method>(**kwargs)`` for the caller, off the event loop."""
+    return await _run(ctx, lambda client: getattr(client, method)(**kwargs))
 
 
 def _capped(items: list[Any], max_results: int | None, key: str) -> dict[str, Any]:
@@ -135,31 +161,175 @@ def _capped(items: list[Any], max_results: int | None, key: str) -> dict[str, An
     return {"count": len(items), "returned": len(capped), key: to_jsonable(capped)}
 
 
+def _stop_name(stop: Any) -> str:
+    """The most useful name for a stop.
+
+    `disassembled_name` is the middle of three widths the API sends: on every one
+    of 44 stops in a real response it was a strict substring of `name` (which
+    prefixes the suburb) and a superset of the platform. Emitting one of the
+    three loses nothing a passenger reads.
+    """
+    return getattr(stop, "disassembled_name", "") or getattr(stop, "name", "") or ""
+
+
+def _add_time(payload: dict[str, Any], label: str, planned: Any, estimated: Any) -> None:
+    """Record one time as the value that will actually happen, plus any delay.
+
+    The API sends planned and estimated separately for both arrival and
+    departure — four fields, of which half were null and 20 of the 22 non-null
+    ones held byte-identical values. Emit the estimate (what you catch) and keep
+    the schedule only when the two genuinely differ, i.e. when there is a delay
+    worth reporting.
+    """
+    actual = estimated or planned
+    if actual is None:
+        return
+    payload[label] = actual.isoformat()
+    if estimated and planned and estimated != planned:
+        payload[f"scheduled_{label}"] = planned.isoformat()
+
+
+def _stop_payload(stop: Any) -> dict[str, Any] | None:
+    """An allowlisted stop: what it is called, where, and when."""
+    if stop is None:
+        return None
+    name = _stop_name(stop)
+    payload: dict[str, Any] = {"name": name}
+
+    stop_id = getattr(stop, "id", "")
+    # Kept so a model can chain straight into get_departures or get_alerts
+    # without spending another find_stop call to re-resolve this stop — but only
+    # when it is a real stop ID. An address resolves to a 129-byte composite
+    # `streetID:...` blob that those tools do not accept, so echoing it once per
+    # leg buys nothing. Composite IDs are the ones with colons in them.
+    if stop_id and ":" not in stop_id:
+        payload["id"] = stop_id
+
+    properties = getattr(stop, "properties", None) or {}
+    for key in _PLATFORM_KEYS:
+        platform = properties.get(key)
+        # Only when the name does not already say it, which it usually does.
+        if platform and platform not in name:
+            payload["platform"] = platform
+            break
+
+    _add_time(
+        payload,
+        "departure",
+        getattr(stop, "departure_planned", None),
+        getattr(stop, "departure_estimated", None),
+    )
+    _add_time(
+        payload,
+        "arrival",
+        getattr(stop, "arrival_planned", None),
+        getattr(stop, "arrival_estimated", None),
+    )
+    return payload
+
+
+def _mode_name(leg: Any) -> str:
+    mode = getattr(getattr(leg, "transportation", None), "mode", None)
+    return getattr(mode, "name", None) or str(mode)
+
+
+def _leg_payload(leg: Any, detail: JourneyDetail) -> dict[str, Any]:
+    """An allowlisted leg.
+
+    Deliberately an allowlist. The old trimming was a blocklist — it dropped
+    `coords` and `stop_sequence` and let everything else through, including the
+    raw upstream `properties` bag (lift equipment heights, `AREA_NIVEAU_DIVA`,
+    `areaGid`, `pbyb` and three copies of the platform name). On a real trip that
+    passthrough was 28% of the payload and none of it is readable by a model.
+    An allowlist cannot regress that way when TfNSW adds a field.
+    """
+    transport = getattr(leg, "transportation", None)
+    payload: dict[str, Any] = {
+        "mode": _mode_name(leg),
+        "duration_min": round(getattr(leg, "duration", 0) / 60),
+        "from": _stop_payload(getattr(leg, "origin", None)),
+        "to": _stop_payload(getattr(leg, "destination", None)),
+    }
+
+    # Walking legs carry a Transport block of empty strings and -1 icon ids —
+    # 209 bytes each of nothing. Omit a field rather than serialize its absence.
+    number = getattr(transport, "number", "") or getattr(transport, "name", "")
+    if number:
+        payload["route"] = number
+    towards = getattr(transport, "destination_name", "")
+    if towards:
+        payload["towards"] = towards
+    if getattr(leg, "is_realtime", False):
+        payload["realtime"] = True
+
+    alerts = [
+        subtitle
+        for info in getattr(leg, "infos", None) or ()
+        if (subtitle := getattr(info, "subtitle", ""))
+    ]
+    if alerts:
+        # The subtitle is the whole alert as far as a model is concerned; the
+        # affected_stops/affected_lines arrays behind it can run to hundreds of
+        # ids that only a map would use.
+        payload["alerts"] = alerts
+
+    if detail in ("stops", "full"):
+        # Names only. Embedding whole Stop objects here was 24% of a real
+        # response and repeated the property bag once per intermediate stop.
+        payload["stops"] = [_stop_name(stop) for stop in getattr(leg, "stop_sequence", None) or ()]
+    if detail == "full":
+        # [lat, lon] pairs rather than {"latitude": .., "longitude": ..}, which
+        # is the same information for a third of the bytes.
+        payload["coords"] = [
+            [coord.latitude, coord.longitude] for coord in getattr(leg, "coords", None) or ()
+        ]
+    return payload
+
+
+def _journey_payload(journey: Any, detail: JourneyDetail) -> Any:
+    """A journey led by the answer, not by the raw data.
+
+    `Journey` already computes departure, arrival, duration and a mode summary
+    as properties, but `to_jsonable` walks `dataclasses.fields()` and so dropped
+    every one of them. A model asking "when do I arrive" therefore had to
+    reconstruct the answer by reading all of the legs. Now it is stated up front,
+    and `detail="answer"` can drop the legs entirely.
+    """
+    legs = getattr(journey, "legs", None)
+    if legs is None:
+        # Not a Journey. Serializing is a presentation concern and must never be
+        # the thing that fails a call, so anything unexpected passes through.
+        return to_jsonable(journey)
+
+    payload: dict[str, Any] = {}
+    _add_time(payload, "departure", None, getattr(journey, "departure_time", None))
+    _add_time(payload, "arrival", None, getattr(journey, "arrival_time", None))
+    payload["duration_min"] = round(getattr(journey, "total_duration", 0) / 60)
+    payload["changes"] = max(
+        0, sum(1 for leg in legs if _mode_name(leg) not in _NON_TRANSIT_MODES) - 1
+    )
+    payload["via"] = getattr(journey, "summary", "")
+    if detail != "answer":
+        payload["legs"] = [_leg_payload(leg, detail) for leg in legs]
+    return payload
+
+
 def _journeys_result(
     journeys: list[Any], max_results: int | None, detail: JourneyDetail
 ) -> dict[str, Any]:
-    """Wrap journeys, trimming each leg to the requested level of detail.
+    """Wrap journeys, rebuilt at the requested level of detail.
 
     Carries `detail` back to the caller so a model that wants the geometry can
     see the result was trimmed and ask again, rather than concluding the data
     does not exist.
     """
-    result = _capped(journeys, max_results, "journeys")
-    dropped = _LEG_FIELDS_DROPPED[detail]
-    if dropped:
-        for journey in result["journeys"]:
-            # Serialized journeys are dicts of dicts, but trimming is a
-            # presentation concern and must never be the thing that fails a
-            # call, so anything unexpected is left untouched rather than raising.
-            if not isinstance(journey, dict):
-                continue
-            for leg in journey.get("legs") or ():
-                if not isinstance(leg, dict):
-                    continue
-                for field in dropped:
-                    leg.pop(field, None)
-    result["detail"] = detail
-    return result
+    capped = journeys if max_results is None else journeys[: max(1, max_results)]
+    return {
+        "count": len(journeys),
+        "returned": len(capped),
+        "detail": detail,
+        "journeys": [_journey_payload(journey, detail) for journey in capped],
+    }
 
 
 def _redact(ctx: Context, message: str) -> str:
@@ -238,58 +408,109 @@ async def best_stop(query: str, ctx: Context) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def _check_endpoint(name: str | None, ident: str | None, label: str) -> None:
+    """Reject an under- or over-specified end of a trip."""
+    if name and ident:
+        raise ToolError(
+            f"Pass either {label} (a place name) or {label}_id (a stop ID), not both. "
+            f"Got {label}={name!r} and {label}_id={ident!r}."
+        )
+    if not name and not ident:
+        raise ToolError(
+            f"A trip needs {'an' if label == 'origin' else 'a'} {label}: pass "
+            f'{label}="<place name>" or {label}_id="<stop ID>".'
+        )
+
+
 @mcp.tool()
 async def plan_trip(
-    origin_id: str,
-    destination_id: str,
     ctx: Context,
+    origin: str | None = None,
+    destination: str | None = None,
+    origin_id: str | None = None,
+    destination_id: str | None = None,
     when: str | None = None,
     arrive_by: bool = False,
-    origin_type: str = "stop",
-    destination_type: str = "stop",
+    origin_type: str = "any",
+    destination_type: str = "any",
     realtime: bool = True,
     wheelchair: bool = False,
     detail: JourneyDetail = "summary",
     max_results: PositiveInt = 5,
 ) -> dict[str, Any]:
-    """Plan a public transport journey between two stops.
+    """Plan a public transport journey between two places.
 
-    Both IDs must be TfNSW stop IDs — resolve names with find_stop or best_stop
-    first. Each journey comes back as a list of legs with times, modes and
-    interchanges.
+    Prefer passing plain place names as `origin` and `destination` — addresses,
+    stations, suburbs and landmarks all work, and the server resolves them
+    itself. You do NOT need to call find_stop or best_stop first; doing so costs
+    two extra round trips for no benefit. Use `origin_id`/`destination_id` only
+    when you already hold a stop ID from an earlier call.
 
     Args:
-        origin_id: Stop ID to depart from.
-        destination_id: Stop ID to arrive at.
+        origin: Place to depart from, e.g. "100 Harris Street Pyrmont" or
+            "Circular Quay". Resolved server-side.
+        destination: Place to arrive at, e.g. "32 Geelong Rd Engadine".
+        origin_id: Stop ID to depart from. Alternative to `origin`, not both.
+        destination_id: Stop ID to arrive at. Alternative to `destination`.
         when: Optional ISO 8601 date/time, e.g. "2026-08-30T09:15". Without an
             offset this is Sydney local time. Defaults to now.
         arrive_by: Treat `when` as the desired arrival time instead of departure.
-        origin_type: Kind of the origin ID — "stop", "poi" or "coord".
-        destination_type: Kind of the destination ID.
+        origin_type: Kind of the origin ID. Leave as "any", which resolves stops,
+            addresses and POIs alike; "stop" rejects address IDs and returns
+            nothing for them.
+        destination_type: Kind of the destination ID. Leave as "any".
         realtime: Include live delay information.
         wheelchair: Return only wheelchair-accessible journeys.
-        detail: How much per-leg data to return. "summary" (default) omits the
-            route polyline and the intermediate stop list, keeping times, modes,
-            interchanges and durations — enough to answer almost any trip
-            question at a fraction of the size. "stops" adds the intermediate
-            stops. "full" adds the map polyline too and is very large — pair it
-            with max_results=1 or 2, or a long journey will exceed the client's
-            tool-result limit and the call will fail.
+        detail: How much to return per journey. "answer" gives only departure,
+            arrival, duration, changes and the mode summary — use it for "when
+            do I get there" and "how long does it take", which is most questions.
+            "summary" (default) adds the legs, each with its times, route,
+            platform and any alerts. "stops" adds intermediate stop names.
+            "full" adds the map polyline and is very large — pair it with
+            max_results=1 or 2 or the call may exceed the client's size limit.
         max_results: Maximum journeys to return.
     """
-    journeys = await _call(
-        ctx,
-        "plan_trip",
-        origin_id=origin_id,
-        destination_id=destination_id,
-        when=parse_when(when),
-        arrive_by=arrive_by,
-        origin_type=origin_type,
-        destination_type=destination_type,
-        realtime=realtime,
-        wheelchair=wheelchair,
-    )
-    return _journeys_result(journeys, max_results, detail)
+    _check_endpoint(origin, origin_id, "origin")
+    _check_endpoint(destination, destination_id, "destination")
+    parsed_when = parse_when(when)
+
+    def work(client: Any) -> tuple[Any, dict[str, Any]]:
+        resolved: dict[str, Any] = {}
+        ends = {"origin": origin_id, "destination": destination_id}
+        for label, query in (("origin", origin), ("destination", destination)):
+            if not query:
+                continue
+            location = client.best_stop(query=query)
+            if location is None:
+                raise ToolError(
+                    f"Could not find anywhere matching {query!r}. Try a fuller name, "
+                    "e.g. include the suburb, or search with find_stop."
+                )
+            if getattr(location, "match_quality", 0) < _MIN_MATCH_QUALITY:
+                raise ToolError(
+                    f"No confident match for {query!r} — the closest was "
+                    f"{location.name!r}, which looks wrong. Check the spelling, add "
+                    "the suburb, or call find_stop to see the candidates."
+                )
+            ends[label] = location.id
+            # Report what the name became: silently planning from the wrong
+            # place is the failure a caller is least likely to notice.
+            resolved[label] = {"id": location.id, "name": location.name}
+
+        journeys = client.plan_trip(
+            origin_id=ends["origin"],
+            destination_id=ends["destination"],
+            when=parsed_when,
+            arrive_by=arrive_by,
+            origin_type=origin_type,
+            destination_type=destination_type,
+            realtime=realtime,
+            wheelchair=wheelchair,
+        )
+        return journeys, resolved
+
+    journeys, resolved = await _run(ctx, work)
+    return {**_journeys_result(journeys, max_results, detail), **resolved}
 
 
 @mcp.tool()
@@ -318,13 +539,13 @@ async def plan_trip_from_coordinate(
         arrive_by: Treat `when` as the desired arrival time.
         realtime: Include live delay information.
         wheelchair: Return only wheelchair-accessible journeys.
-        detail: How much per-leg data to return. "summary" (default) omits the
-            route polyline and the intermediate stop list, keeping times, modes,
-            interchanges and durations — enough to answer almost any trip
-            question at a fraction of the size. "stops" adds the intermediate
-            stops. "full" adds the map polyline too and is very large — pair it
-            with max_results=1 or 2, or a long journey will exceed the client's
-            tool-result limit and the call will fail.
+        detail: How much to return per journey. "answer" gives only departure,
+            arrival, duration, changes and the mode summary — use it for "when
+            do I get there" and "how long does it take", which is most questions.
+            "summary" (default) adds the legs, each with its times, route,
+            platform and any alerts. "stops" adds intermediate stop names.
+            "full" adds the map polyline and is very large — pair it with
+            max_results=1 or 2 or the call may exceed the client's size limit.
         max_results: Maximum journeys to return.
     """
     journeys = await _call(
@@ -365,13 +586,13 @@ async def plan_cycling_trip(
         bike_only: Cycle the whole way. Set false to allow mixed bike + transit.
         max_time_minutes: Reject routes longer than this.
         cycle_speed: Assumed cycling speed in km/h.
-        detail: How much per-leg data to return. "summary" (default) omits the
-            route polyline and the intermediate stop list, keeping times, modes,
-            interchanges and durations — enough to answer almost any trip
-            question at a fraction of the size. "stops" adds the intermediate
-            stops. "full" adds the map polyline too and is very large — pair it
-            with max_results=1 or 2, or a long journey will exceed the client's
-            tool-result limit and the call will fail.
+        detail: How much to return per journey. "answer" gives only departure,
+            arrival, duration, changes and the mode summary — use it for "when
+            do I get there" and "how long does it take", which is most questions.
+            "summary" (default) adds the legs, each with its times, route,
+            platform and any alerts. "stops" adds intermediate stop names.
+            "full" adds the map polyline and is very large — pair it with
+            max_results=1 or 2 or the call may exceed the client's size limit.
         max_results: Maximum journeys to return.
     """
     journeys = await _call(
