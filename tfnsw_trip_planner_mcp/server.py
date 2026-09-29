@@ -8,6 +8,7 @@ return JSON-safe data wrapped in an object.
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -62,6 +63,10 @@ _NON_TRANSIT_MODES = frozenset({"WALK", "WALK_ALT", "CYCLE"})
 # The upstream property bag repeats the platform under three keys. Read the
 # first one that is present and drop the rest.
 _PLATFORM_KEYS = ("platformName", "plannedPlatformName", "stoppingPointPlanned")
+
+# find_nearby draw classes whose `description` is a stop ID that get_departures
+# accepts — verified live: platform 2000328 returned Central Platform 8's board.
+_NEARBY_STOP_CLASSES = frozenset({"StopPoint", "StopArea"})
 
 # Below this, a resolved place name is a guess rather than a match, and planning
 # from it would answer a question nobody asked. TfNSW's stop finder practically
@@ -134,13 +139,20 @@ async def _call(ctx: Context, method: str, **kwargs: Any) -> Any:
     return await _run(ctx, lambda client: getattr(client, method)(**kwargs))
 
 
-def _capped(items: list[Any], max_results: int | None, key: str) -> dict[str, Any]:
+def _capped(
+    items: list[Any],
+    max_results: int | None,
+    key: str,
+    payload: Callable[[Any], Any] = to_jsonable,
+) -> dict[str, Any]:
     """Wrap a list result, truncating it to *max_results*.
 
     Every list-returning tool goes through here so they all answer with the same
     shape — `count` (the true total), `returned` (how many are included), and the
     items. Pass ``max_results=None`` for endpoints the upstream API already
-    bounds; `returned` then equals `count`.
+    bounds; `returned` then equals `count`. *payload* serializes each included
+    item, so a tool can pass an allowlisting function in place of the default
+    full dump — and only the items that survive the cap are serialized.
 
     Some endpoints answer with far more than a caller can use: an unfiltered
     alert fetch returns every alert in NSW (~283, 1.3MB of JSON) and a 500m
@@ -158,7 +170,24 @@ def _capped(items: list[Any], max_results: int | None, key: str) -> dict[str, An
         # transport. The schema also enforces a minimum of 1, so this is the
         # second line of defence, not the only one.
         capped = items[: max(1, max_results)]
-    return {"count": len(items), "returned": len(capped), key: to_jsonable(capped)}
+    return {"count": len(items), "returned": len(capped), key: [payload(item) for item in capped]}
+
+
+def _concise_capped(
+    items: list[Any],
+    max_results: int | None,
+    key: str,
+    concise: bool,
+    concise_payload: Callable[[Any], Any],
+) -> dict[str, Any]:
+    """`_capped`, serializing each item with *concise_payload* when *concise*.
+
+    Reports `concise` back, as `detail` is for journeys, so a model can see the
+    result was trimmed and ask again rather than conclude the data does not
+    exist.
+    """
+    payload = concise_payload if concise else to_jsonable
+    return {**_capped(items, max_results, key, payload), "concise": concise}
 
 
 def _stop_name(stop: Any) -> str:
@@ -668,22 +697,47 @@ async def get_departures(
         platform_id=platform_id,
         realtime=realtime,
     )
-    return {
-        "count": len(departures),
-        "returned": len(departures),
-        # Reported back, as `detail` is for journeys, so a model can see the
-        # result was trimmed and ask again rather than conclude the data does
-        # not exist.
-        "concise": concise,
-        "departures": [_departure_payload(event) for event in departures]
-        if concise
-        else to_jsonable(departures),
-    }
+    return _concise_capped(departures, None, "departures", concise, _departure_payload)
 
 
 # --------------------------------------------------------------------------
 # Service Alert API
 # --------------------------------------------------------------------------
+
+
+def _names(items: list[Any], *keys: str) -> list[str]:
+    """The first non-empty of *keys* from each raw dict, deduplicated in order."""
+    names = (
+        next((name for key in keys if (name := item.get(key))), "")
+        for item in items
+        if isinstance(item, dict)
+    )
+    return [name for name in dict.fromkeys(names) if name]
+
+
+def _alert_payload(alert: Any) -> Any:
+    """An allowlisted alert: what it says, and which lines and stops it hits.
+
+    `affected_lines` was over 90% of a real response. Each line is a whole
+    object — operator, product, destination, description — and trip-level
+    alerts ("Running late", "Cancelled") embed the trip's full timetable too.
+    One Central alert listed 163 line objects for 112 distinct lines, which made
+    a single-stop fetch (56.7 KB) larger than a network-wide one. The line
+    numbers and stop names are all a model reads from that.
+    """
+    lines = getattr(alert, "affected_lines", None)
+    if lines is None:
+        # Not a ServiceAlert. Serializing must never be the thing that fails a
+        # call, so anything unexpected passes through.
+        return to_jsonable(alert)
+    return {
+        "subtitle": getattr(alert, "subtitle", ""),
+        "url": getattr(alert, "url", ""),
+        "last_modification": to_jsonable(getattr(alert, "last_modification", None)),
+        # The bus `number` is the route ("333"); a line with none is named instead.
+        "affected_lines": _names(lines, "number", "name"),
+        "affected_stops": _names(getattr(alert, "affected_stops", None) or [], "name"),
+    }
 
 
 @mcp.tool()
@@ -693,6 +747,7 @@ async def get_alerts(
     stop_id: str | None = None,
     current_only: bool = True,
     max_results: PositiveInt = 20,
+    concise: bool = True,
 ) -> dict[str, Any]:
     """Retrieve service alerts: disruptions, trackwork and planned changes.
 
@@ -706,16 +761,60 @@ async def get_alerts(
         stop_id: Restrict to alerts affecting one stop. Omit for network-wide.
         current_only: Only alerts in effect now. Set false to include future ones.
         max_results: Maximum alerts to return.
+        concise: Return each alert's subtitle, url, last_modification, and the
+            affected_lines and affected_stops as lists of line numbers and stop
+            names. Set false for the full line and stop objects, including
+            operators, stop IDs and affected trip timetables — which can run to
+            tens of KB for a single alert.
     """
     alerts = await _call(
         ctx, "get_alerts", when=parse_when(when), stop_id=stop_id, current_only=current_only
     )
-    return _capped(alerts, max_results, "alerts")
+    return _concise_capped(alerts, max_results, "alerts", concise, _alert_payload)
 
 
 # --------------------------------------------------------------------------
 # Coordinate Request API
 # --------------------------------------------------------------------------
+
+
+def _nearby_payload(location: Any) -> Any:
+    """An allowlisted nearby location: what it is and how far away.
+
+    A full `Location` here carries placeholder match fields (`match_quality: 0`,
+    `is_best: false`), empty street fields, and the distance a second time in
+    the raw `properties` bag — 85% of a real response.
+
+    The allowlist cannot simply be the named fields, though. Measured at
+    Central, `type` was "unknown" on all 497 results and 359 of them had no
+    name; what each one is lives only in `GIS_DRAW_CLASS` ("Bench", "EntryExit",
+    "StopPoint", ...), so that is reported as `kind`. Likewise every `id` was a
+    composite `coord:...` blob, and a stop's real ID is in `description`.
+    """
+    if not hasattr(location, "distance"):
+        # Not a Location. Serializing must never be the thing that fails a call,
+        # so anything unexpected passes through.
+        return to_jsonable(location)
+    properties = getattr(location, "properties", None) or {}
+    payload: dict[str, Any] = {}
+    name = getattr(location, "name", "")
+    if name:
+        payload["name"] = name
+    payload["kind"] = properties.get("GIS_DRAW_CLASS") or to_jsonable(
+        getattr(location, "type", None)
+    )
+    payload["distance"] = location.distance
+
+    # Kept so a model can chain straight into get_departures. Only a stop's
+    # `description` is its ID: on an EntryExit it is the exit number.
+    location_id = getattr(location, "id", "")
+    if location_id and ":" not in location_id:
+        payload["id"] = location_id
+    elif properties.get("GIS_DRAW_CLASS") in _NEARBY_STOP_CLASSES:
+        description = properties.get("description", "")
+        if description.isdigit():
+            payload["id"] = description
+    return payload
 
 
 @mcp.tool()
@@ -727,6 +826,7 @@ async def find_nearby(
     type_1: str = "GIS_POINT",
     draw_class: int | None = None,
     max_results: PositiveInt = 50,
+    concise: bool = True,
 ) -> dict[str, Any]:
     """Find stops and points of interest near a GPS coordinate.
 
@@ -742,6 +842,11 @@ async def find_nearby(
         type_1: TfNSW result category. "GIS_POINT" covers stops and POIs.
         draw_class: Optional TfNSW sub-category filter.
         max_results: Maximum locations to return.
+        concise: Return each location's name (omitted when it has none), kind
+            (e.g. "StopPoint", "StopArea", "EntryExit", "Bench"), distance in
+            metres, and id when it is a stop ID usable with get_departures. Set
+            false for every field, including coordinates and the raw TfNSW
+            properties.
     """
     locations = await _call(
         ctx,
@@ -752,7 +857,7 @@ async def find_nearby(
         type_1=type_1,
         draw_class=draw_class,
     )
-    return _capped(locations, max_results, "locations")
+    return _concise_capped(locations, max_results, "locations", concise, _nearby_payload)
 
 
 # --------------------------------------------------------------------------

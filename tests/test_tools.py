@@ -415,7 +415,111 @@ async def test_get_alerts_forwards_arguments(ctx, client):
 async def test_get_alerts_wraps_results(ctx, client):
     client.get_alerts.return_value = ["a1"]
 
-    assert await server.get_alerts(ctx=ctx) == {"count": 1, "returned": 1, "alerts": ["a1"]}
+    assert await server.get_alerts(ctx=ctx) == {
+        "count": 1,
+        "returned": 1,
+        "concise": True,
+        "alerts": ["a1"],
+    }
+
+
+def make_alert_line(number, name=None):
+    # Real shape: every affected line is a whole object, and trip-level alerts
+    # ("Running late", "Cancelled") embed the full timetable of the trip.
+    return {
+        "id": f"nsw:020{number}: :H:",
+        "name": name or f"Sydney Trains Network {number}",
+        "number": number,
+        "description": "City to Parramatta or Leppington",
+        "product": {"id": 1, "class": 1, "iconId": 1},
+        "operator": {"id": "x0001", "name": "Sydney Trains"},
+        "destination": {"name": "Parramatta Station", "type": "stop"},
+        "trips": [
+            {
+                "tripCode": 1478,
+                "stops": [
+                    {"id": f"1010110{i}", "name": f"Station {i}, Platform 1", "type": "stop"}
+                    for i in range(20)
+                ],
+            }
+        ],
+    }
+
+
+def make_alert_stop(name):
+    return {
+        "id": "213510",
+        "isGlobalId": True,
+        "name": name,
+        "type": "stop",
+        "parent": {"id": "placeID:95356003:1", "name": "Strathfield", "type": "locality"},
+        "properties": {"stopId": "10101206"},
+    }
+
+
+def make_alert(lines=(), stops=()):
+    return ServiceAlert(
+        subtitle="Station Update - Central",
+        url="https://transportnsw.info/alerts/details#/ems-59309",
+        last_modification=at(9, 30),
+        affected_stops=list(stops),
+        affected_lines=list(lines),
+    )
+
+
+async def test_get_alerts_is_concise_by_default(ctx, client):
+    client.get_alerts.return_value = [
+        make_alert(
+            # One Central alert really does list the same line many times over
+            # (163 line objects for 112 distinct lines), so dedupe by number.
+            lines=[make_alert_line("T2"), make_alert_line("T8"), make_alert_line("T2")],
+            stops=[make_alert_stop("Strathfield Station"), make_alert_stop("Strathfield Station")],
+        )
+    ]
+
+    result = await server.get_alerts(stop_id="200060", ctx=ctx)
+
+    assert result["concise"] is True
+    assert result["alerts"] == [
+        {
+            "subtitle": "Station Update - Central",
+            "url": "https://transportnsw.info/alerts/details#/ems-59309",
+            "last_modification": "2026-09-08T09:30:00+10:00",
+            "affected_lines": ["T2", "T8"],
+            "affected_stops": ["Strathfield Station"],
+        }
+    ]
+
+
+async def test_get_alerts_concise_falls_back_to_the_line_name(ctx, client):
+    line = make_alert_line("", name="Blue Mountains Line")
+    client.get_alerts.return_value = [make_alert(lines=[line, {"id": "nameless"}])]
+
+    result = await server.get_alerts(ctx=ctx)
+
+    assert result["alerts"][0]["affected_lines"] == ["Blue Mountains Line"]
+
+
+async def test_get_alerts_concise_false_returns_every_field(ctx, client):
+    alert = make_alert(lines=[make_alert_line("T2")], stops=[make_alert_stop("Strathfield")])
+    client.get_alerts.return_value = [alert]
+
+    result = await server.get_alerts(concise=False, ctx=ctx)
+
+    assert result["concise"] is False
+    assert result["alerts"] == [to_jsonable(alert)]
+    assert result["alerts"][0]["affected_lines"][0]["trips"]
+
+
+async def test_get_alerts_concise_is_far_smaller(ctx, client):
+    client.get_alerts.return_value = [
+        make_alert(lines=[make_alert_line(f"T{i}") for i in range(10)]) for _ in range(20)
+    ]
+
+    concise = await server.get_alerts(ctx=ctx)
+    full = await server.get_alerts(concise=False, ctx=ctx)
+
+    assert len(json.dumps(concise)) < len(json.dumps(full)) / 10
 
 
 async def test_get_alerts_caps_results_and_reports_the_real_total(ctx, client):
@@ -479,6 +583,90 @@ async def test_find_nearby_is_capped_by_default(ctx, client):
     result = await server.find_nearby(latitude=-33.8613, longitude=151.2107, ctx=ctx)
 
     assert result["returned"] < 618, "a nearby search must be capped by default"
+
+
+def make_nearby(name="Exit 2: Eddy Ave", draw_class="EntryExit", description="2", distance=19):
+    # Real shape of a GIS_POINT result, as measured at Central: `type` is
+    # "unknown" on every one and the id is always a composite `coord:` blob.
+    # What the thing is lives in GIS_DRAW_CLASS, and a stop's real ID in
+    # `description` — which on an EntryExit is the exit number instead.
+    location = make_location(
+        name=name, loc_id=f"coord:4889177:3757168:GDAV: {name}", match_quality=0
+    )
+    location.type = LocationType.UNKNOWN
+    location.is_best = False
+    location.distance = distance
+    location.properties = {
+        "distance": distance,
+        "GIS_DRAW_CLASS_TYPE": "POINT",
+        "GIS_DRAW_CLASS": draw_class,
+        "GIS_NIVEAU": "1.0",
+    }
+    if description:
+        location.properties["description"] = description
+    return location
+
+
+async def test_find_nearby_is_concise_by_default(ctx, client):
+    client.find_nearby.return_value = [
+        make_nearby(),
+        make_nearby(name="Central, Platform 8", draw_class="StopPoint", description="2000328"),
+        make_nearby(
+            name="Central Station, Eddy Av, Stand B", draw_class="StopArea", description="200051"
+        ),
+        # 359 of 497 real results near Central had no name at all — mostly
+        # benches. The kind is then the only thing that says what it is.
+        make_nearby(name="", draw_class="Bench", description="", distance=22),
+    ]
+
+    result = await server.find_nearby(latitude=-33.8832, longitude=151.2069, ctx=ctx)
+
+    assert result["concise"] is True
+    assert result["locations"] == [
+        # An exit's description is its exit number, not a stop ID.
+        {"name": "Exit 2: Eddy Ave", "kind": "EntryExit", "distance": 19},
+        # A stop's ID is kept so a model can chain into get_departures.
+        {"name": "Central, Platform 8", "kind": "StopPoint", "distance": 19, "id": "2000328"},
+        {
+            "name": "Central Station, Eddy Av, Stand B",
+            "kind": "StopArea",
+            "distance": 19,
+            "id": "200051",
+        },
+        {"kind": "Bench", "distance": 22},
+    ]
+
+
+async def test_find_nearby_concise_keeps_a_plain_stop_id_and_falls_back_to_type(ctx, client):
+    # Not what GIS_POINT returns, but another type_1 may: a Location with a
+    # real ID and no draw class.
+    client.find_nearby.return_value = [make_location(name="Circular Quay", loc_id="200020")]
+
+    result = await server.find_nearby(latitude=-33.8613, longitude=151.2107, ctx=ctx)
+
+    assert result["locations"] == [
+        {"name": "Circular Quay", "kind": "stop", "distance": None, "id": "200020"}
+    ]
+
+
+async def test_find_nearby_concise_false_returns_every_field(ctx, client):
+    location = make_nearby()
+    client.find_nearby.return_value = [location]
+
+    result = await server.find_nearby(latitude=-33.8832, longitude=151.2069, concise=False, ctx=ctx)
+
+    assert result["concise"] is False
+    assert result["locations"] == [to_jsonable(location)]
+    assert result["locations"][0]["coord"]
+
+
+async def test_find_nearby_concise_is_far_smaller(ctx, client):
+    client.find_nearby.return_value = [make_nearby() for _ in range(50)]
+
+    concise = await server.find_nearby(latitude=-33.8832, longitude=151.2069, ctx=ctx)
+    full = await server.find_nearby(latitude=-33.8832, longitude=151.2069, concise=False, ctx=ctx)
+
+    assert len(json.dumps(concise)) < len(json.dumps(full)) / 4
 
 
 async def test_get_vehicle_positions_caps_results_and_reports_the_real_total(ctx, client):

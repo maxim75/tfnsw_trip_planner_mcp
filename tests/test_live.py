@@ -214,6 +214,24 @@ async def test_alerts_endpoint_answers(live_server):
 
     assert result.is_error is False, result.content[0].text
     assert result.structured_content["count"] >= 0
+    for alert in result.structured_content["alerts"]:
+        # Concise by default: lines and stops arrive as plain names.
+        assert all(isinstance(line, str) for line in alert["affected_lines"])
+        assert all(isinstance(stop, str) for stop in alert["affected_stops"])
+
+
+async def test_nearby_is_concise_by_default(live_server):
+    async with real_session(live_server) as session:
+        result = await session.call_tool(
+            "find_nearby", {"latitude": -33.8832, "longitude": 151.2069, "max_results": 10}
+        )
+
+    assert result.is_error is False, result.content[0].text
+    locations = result.structured_content["locations"]
+    assert locations, "Central Station always has something within 500m"
+    assert all(set(loc) <= {"name", "kind", "distance", "id"} for loc in locations)
+    # Every result says what it is, even the many that have no name.
+    assert all(loc["kind"] for loc in locations)
 
 
 async def test_a_bad_key_surfaces_the_upstream_error(live_server):
