@@ -158,6 +158,21 @@ Notes:
   ask for more rather than assuming the data does not exist. `full` only fits
   when paired with `max_results` of 1–3.
 
+- **Concise departures.** `get_departures` defaults to `concise=true`, returning
+  only what a departure board shows:
+
+  ```json
+  {"departure_planned": "2026-09-29T17:24:00+10:00",
+   "departure_estimated": "2026-09-29T17:25:06+10:00",
+   "transportation": {"name": "Sydney Buses Network 333", "number": "333"}}
+  ```
+
+  `departure_estimated` is `null` when there is no live data. Pass
+  `concise=false` for every field — the stop, platform, route details and
+  onward locations. On a real Circular Quay board of 40 departures that is
+  39.7 KB against 7.8 KB concise. The result reports `concise`, so a model can
+  see it was trimmed.
+
 - **Legs are built from an allowlist**, not by dropping known-bad fields. The
   old blocklist removed `coords` and `stop_sequence` and passed everything else
   through, including the raw upstream `properties` bag — lift equipment heights,

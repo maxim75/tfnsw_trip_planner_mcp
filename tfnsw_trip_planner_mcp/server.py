@@ -614,6 +614,30 @@ async def plan_cycling_trip(
 # --------------------------------------------------------------------------
 
 
+def _departure_payload(event: Any) -> Any:
+    """An allowlisted departure: when it leaves, and what it is.
+
+    A full `StopEvent` repeats the stop's whole `Location` — coordinates, the
+    raw `properties` bag — on every departure, although the caller already
+    asked for that stop by ID, and carries `onwards_locations`, which only a
+    carriage-occupancy display would use. Field names follow the library so the
+    concise form is a strict subset of `concise=False`.
+    """
+    transport = getattr(event, "transportation", None)
+    if transport is None:
+        # Not a StopEvent. Serializing must never be the thing that fails a
+        # call, so anything unexpected passes through.
+        return to_jsonable(event)
+    return {
+        "departure_planned": to_jsonable(getattr(event, "departure_planned", None)),
+        "departure_estimated": to_jsonable(getattr(event, "departure_estimated", None)),
+        "transportation": {
+            "name": getattr(transport, "name", ""),
+            "number": getattr(transport, "number", ""),
+        },
+    }
+
+
 @mcp.tool()
 async def get_departures(
     stop_id: str,
@@ -621,6 +645,7 @@ async def get_departures(
     when: str | None = None,
     platform_id: str | None = None,
     realtime: bool = True,
+    concise: bool = True,
 ) -> dict[str, Any]:
     """List upcoming departures from a stop — the live departure board.
 
@@ -630,6 +655,10 @@ async def get_departures(
             offset given. Defaults to now.
         platform_id: Restrict to a single platform or stand.
         realtime: Include live delay information alongside scheduled times.
+        concise: Return only departure_planned, departure_estimated (null when
+            there is no live data) and transportation name and number per
+            departure — enough for "when is the next train". Set false for every
+            field, including the stop, platform, route and onward locations.
     """
     departures = await _call(
         ctx,
@@ -639,7 +668,17 @@ async def get_departures(
         platform_id=platform_id,
         realtime=realtime,
     )
-    return _capped(departures, None, "departures")
+    return {
+        "count": len(departures),
+        "returned": len(departures),
+        # Reported back, as `detail` is for journeys, so a model can see the
+        # result was trimmed and ask again rather than conclude the data does
+        # not exist.
+        "concise": concise,
+        "departures": [_departure_payload(event) for event in departures]
+        if concise
+        else to_jsonable(departures),
+    }
 
 
 # --------------------------------------------------------------------------

@@ -10,9 +10,11 @@ from tfnsw_trip_planner.models import Coordinate, Journey, Leg, Location
 from tfnsw_trip_planner.models.enums import CyclingProfile, LocationType, TransportMode
 from tfnsw_trip_planner.models.service_alert import ServiceAlert
 from tfnsw_trip_planner.models.stop import Stop
+from tfnsw_trip_planner.models.stop_event import StopEvent
 from tfnsw_trip_planner.models.transport import Transport
 
 from tfnsw_trip_planner_mcp import server
+from tfnsw_trip_planner_mcp.serialization import to_jsonable
 from tfnsw_trip_planner_mcp.server import _capped, parse_when
 
 
@@ -130,9 +132,10 @@ async def test_every_list_tool_returns_the_same_shape(tool_name, ctx, client):
 
     result = await getattr(server, tool_name)(**LIST_TOOL_ARGS[tool_name], ctx=ctx)
 
-    # Journey tools additionally report the detail level they applied.
+    # Journey tools additionally report the detail level they applied, and
+    # get_departures whether it trimmed each departure.
     assert {"count", "returned", LIST_TOOL_KEYS[tool_name]} <= set(result)
-    assert set(result) - {"detail"} == {"count", "returned", LIST_TOOL_KEYS[tool_name]}
+    assert set(result) - {"detail", "concise"} == {"count", "returned", LIST_TOOL_KEYS[tool_name]}
     assert result["count"] == 2
     assert result["returned"] == 2
 
@@ -336,8 +339,69 @@ async def test_get_departures_wraps_results(ctx, client):
     assert await server.get_departures(stop_id="200020", ctx=ctx) == {
         "count": 2,
         "returned": 2,
+        "concise": True,
         "departures": ["d1", "d2"],
     }
+
+
+def make_stop_event(dep=None, dep_est=None, number="T4", name="Sydney Trains Network"):
+    transport = make_transport(number=number)
+    transport.name = name
+    return StopEvent(
+        location=make_stop(),
+        transportation=transport,
+        departure_planned=dep,
+        departure_estimated=dep_est,
+        onwards_locations=[{"properties": dict(REAL_STOP_JUNK)}],
+    )
+
+
+async def test_get_departures_is_concise_by_default(ctx, client):
+    client.get_departures.return_value = [
+        make_stop_event(dep=at(18, 36), dep_est=at(18, 41)),
+        make_stop_event(dep=at(18, 50), number="T8"),
+    ]
+
+    result = await server.get_departures(stop_id="200060", ctx=ctx)
+
+    assert result["concise"] is True
+    assert result["departures"] == [
+        {
+            "departure_planned": "2026-09-08T18:36:00+10:00",
+            "departure_estimated": "2026-09-08T18:41:00+10:00",
+            "transportation": {"name": "Sydney Trains Network", "number": "T4"},
+        },
+        {
+            # A null estimate is kept: it says "no live data", which is itself
+            # an answer to "is it running late".
+            "departure_planned": "2026-09-08T18:50:00+10:00",
+            "departure_estimated": None,
+            "transportation": {"name": "Sydney Trains Network", "number": "T8"},
+        },
+    ]
+
+
+async def test_get_departures_concise_false_returns_every_field(ctx, client):
+    event = make_stop_event(dep=at(18, 36), dep_est=at(18, 41))
+    client.get_departures.return_value = [event]
+
+    result = await server.get_departures(stop_id="200060", concise=False, ctx=ctx)
+
+    assert result["concise"] is False
+    assert result["departures"] == [to_jsonable(event)]
+    assert result["departures"][0]["location"]["name"]
+    assert result["departures"][0]["onwards_locations"]
+
+
+async def test_get_departures_concise_is_far_smaller(ctx, client):
+    client.get_departures.return_value = [
+        make_stop_event(dep=at(18, 36), dep_est=at(18, 41)) for _ in range(40)
+    ]
+
+    concise = await server.get_departures(stop_id="200060", ctx=ctx)
+    full = await server.get_departures(stop_id="200060", concise=False, ctx=ctx)
+
+    assert len(json.dumps(concise)) < len(json.dumps(full)) / 4
 
 
 async def test_get_alerts_forwards_arguments(ctx, client):
