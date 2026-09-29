@@ -158,8 +158,16 @@ Notes:
   ask for more rather than assuming the data does not exist. `full` only fits
   when paired with `max_results` of 1–3.
 
-- **Concise departures.** `get_departures` defaults to `concise=true`, returning
-  only what a departure board shows:
+- **Concise results.** `get_departures`, `get_alerts` and `find_nearby` default
+  to `concise=true`, returning only the fields a model reads. Pass
+  `concise=false` for every field. Each result reports `concise`, so a model
+  can see it was trimmed.
+
+  | Tool | concise fields | real response, full → concise |
+  |---|---|---|
+  | `get_departures` | `departure_planned`, `departure_estimated`, `transportation.name`/`number` | Circular Quay, 40 departures: 39.7 → 7.8 KB |
+  | `get_alerts` | `subtitle`, `url`, `last_modification`, `affected_lines`, `affected_stops` | Central (`stop_id=200060`): 56.8 → 2.4 KB |
+  | `find_nearby` | `name`, `kind`, `distance`, `id` | Central, 500 m, 50 results: 18.9 → 2.8 KB |
 
   ```json
   {"departure_planned": "2026-09-29T17:24:00+10:00",
@@ -167,11 +175,19 @@ Notes:
    "transportation": {"name": "Sydney Buses Network 333", "number": "333"}}
   ```
 
-  `departure_estimated` is `null` when there is no live data. Pass
-  `concise=false` for every field — the stop, platform, route details and
-  onward locations. On a real Circular Quay board of 40 departures that is
-  39.7 KB against 7.8 KB concise. The result reports `concise`, so a model can
-  see it was trimmed.
+  `departure_estimated` is `null` when there is no live data.
+
+  In concise alerts, `affected_lines` and `affected_stops` are deduplicated
+  lists of line numbers and stop names. Full, each affected line is a whole
+  object, and trip-level alerts embed the trip's timetable. One Central alert
+  lists 163 lines, which made a single-stop fetch *larger* than a network-wide
+  one.
+
+  In concise nearby results, `kind` is the TfNSW draw class (`StopPoint`,
+  `StopArea`, `EntryExit`, `Bench`, …), because the raw `type` is `unknown` on
+  every result and most results have no name. `id` appears only on stops, taken
+  from the stop ID TfNSW puts in `properties.description`. Every raw `id` is a
+  `coord:...` string that no other tool accepts.
 
 - **Legs are built from an allowlist**, not by dropping known-bad fields. The
   old blocklist removed `coords` and `stop_sequence` and passed everything else
