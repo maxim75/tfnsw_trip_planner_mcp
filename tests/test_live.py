@@ -116,13 +116,18 @@ async def test_departures_for_a_resolved_stop(live_server):
         stop_id = best.structured_content["location"]["id"]
 
         result = await session.call_tool("get_departures", {"stop_id": stop_id})
+        full = await session.call_tool("get_departures", {"stop_id": stop_id, "concise": False})
 
     assert stop_id == "200020", f"best_stop should resolve Circular Quay, got {stop_id!r}"
     assert result.is_error is False, result.content[0].text
     # A live network always has something scheduled from Circular Quay.
     assert result.structured_content["count"] > 0
+    departure = result.structured_content["departures"][0]
+    assert departure["departure_planned"]
+    assert departure["transportation"]["number"] or departure["transportation"]["name"]
+    assert full.is_error is False, full.content[0].text
     # StopEvent uses a different model than Location and does parse names.
-    assert result.structured_content["departures"][0]["location"]["name"]
+    assert full.structured_content["departures"][0]["location"]["name"]
 
 
 async def test_plan_trip_between_two_real_stops(live_server):
