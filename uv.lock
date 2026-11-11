@@ -1030,7 +1030,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", specifier = ">=1.9.0" },
+    { name = "mcp", specifier = ">=2.1.1" },
     { name = "starlette", specifier = ">=0.37.0" },
     { name = "tfnsw-trip-planner", extras = ["realtime"], specifier = ">=1.4.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30.0" },

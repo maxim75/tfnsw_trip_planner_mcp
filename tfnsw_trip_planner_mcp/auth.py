@@ -2,7 +2,13 @@
 
 This server holds no TfNSW credentials of its own. Every caller supplies their
 own key on every request via the ``X-API-Key`` header, and each tool call gets a
-freshly built client that is closed again as soon as the call returns. Keeping
+freshly built client that is closed again as soon as the call returns.
+
+The one exception is stdio. A stdio server is spawned by exactly one local
+client and has no HTTP headers, so that client passes its key through the
+``TFNSW_API_KEY`` environment variable instead. The entry point registers it
+with :func:`set_stdio_api_key` only when it starts in stdio mode; an HTTP
+deployment never reads that variable, so it can never serve a key of its own. Keeping
 clients per-call (rather than caching one per key) means one caller's key can
 never be reused to serve another's request.
 """
@@ -16,17 +22,30 @@ import requests
 from requests.adapters import HTTPAdapter
 from tfnsw_trip_planner import TripPlannerClient
 
-__all__ = ["API_KEY_HEADER", "MissingAPIKeyError", "api_key_from_headers", "client_for"]
+__all__ = [
+    "API_KEY_ENV",
+    "API_KEY_HEADER",
+    "MissingAPIKeyError",
+    "api_key_from_headers",
+    "client_for",
+    "set_stdio_api_key",
+]
 
 API_KEY_HEADER = "X-API-Key"
+API_KEY_ENV = "TFNSW_API_KEY"
 
 _SCHEMES = frozenset({"apikey", "bearer"})
 
 _MISSING_KEY_MESSAGE = (
     f"No TfNSW API key supplied. Send your key in the {API_KEY_HEADER} HTTP header "
-    "on every request to this server. Get a free key from "
-    "https://opendata.transport.nsw.gov.au."
+    "on every request to this server, or, when running it over stdio, set the "
+    f"{API_KEY_ENV} environment variable for the server process. Get a free key "
+    "from https://opendata.transport.nsw.gov.au."
 )
+
+# Set only by the stdio entry point. None means "headers only", which is what
+# every HTTP deployment gets.
+_stdio_api_key: str | None = None
 
 
 class MissingAPIKeyError(ValueError):
@@ -46,9 +65,14 @@ def api_key_from_headers(headers: Mapping[str, str] | None) -> str:
         wanted = API_KEY_HEADER.lower()
         for name, candidate in headers.items():
             if name.lower() == wanted:
-                value = (candidate or "").strip()
+                value = candidate or ""
                 break
+    return _normalise(value)
 
+
+def _normalise(value: str) -> str:
+    """Strip whitespace and any scheme prefix; raise if no key is left."""
+    value = value.strip()
     # TfNSW's own API takes `Authorization: apikey <key>`, so a copy-pasted
     # value may still carry the scheme. Split on the first run of whitespace so
     # a bare scheme with no key behind it falls through to the error below,
@@ -60,6 +84,26 @@ def api_key_from_headers(headers: Mapping[str, str] | None) -> str:
     if not value:
         raise MissingAPIKeyError(_MISSING_KEY_MESSAGE)
     return value
+
+
+def set_stdio_api_key(value: str | None) -> bool:
+    """Register the key a stdio server uses when a request carries no headers.
+
+    Called by the entry point only when serving over stdio. Accepts the same
+    forms as the header (surrounding whitespace, an ``apikey``/``Bearer``
+    prefix). A missing or blank value clears it, so tool calls fail with the
+    usual message while the handshake still works — which is what directory
+    scanners that spawn the server without a key need.
+
+    Returns:
+        True if a usable key was registered.
+    """
+    global _stdio_api_key
+    try:
+        _stdio_api_key = _normalise(value or "")
+    except MissingAPIKeyError:
+        _stdio_api_key = None
+    return _stdio_api_key is not None
 
 
 class _SharedPoolAdapter(HTTPAdapter):
@@ -98,7 +142,8 @@ def client_for(ctx) -> Iterator[TripPlannerClient]:
     """Yield a ``TripPlannerClient`` built from the current request's API key.
 
     ``ctx`` is the MCP ``Context`` injected into a tool. Its ``headers`` are
-    populated by the HTTP transports and are ``None`` under stdio.
+    populated by the HTTP transports and are ``None`` under stdio, where the key
+    registered by :func:`set_stdio_api_key` is used instead.
 
     The client and its session are per-call, but the underlying connections are
     pooled process-wide. The split matters: ``TripPlannerClient`` writes the
@@ -107,7 +152,11 @@ def client_for(ctx) -> Iterator[TripPlannerClient]:
     Sharing only the pool keeps credentials strictly per-call while still
     reusing sockets.
     """
-    api_key = api_key_from_headers(getattr(ctx, "headers", None))
+    headers = getattr(ctx, "headers", None)
+    if headers is None and _stdio_api_key is not None:
+        api_key = _stdio_api_key
+    else:
+        api_key = api_key_from_headers(headers)
     client = TripPlannerClient(api_key=api_key, session=_pooled_session())
     try:
         yield client

@@ -25,6 +25,12 @@ TfNSW's own docs use the former.
 Each tool call builds a client from that request's key and discards it when the
 call returns, so one caller's key is never reused for another's request.
 
+Over **stdio** (see [Running locally over stdio](#running-locally-over-stdio-uvx))
+there are no headers: the server is spawned by a single local client, which
+passes its key in the `TFNSW_API_KEY` environment variable instead. That variable
+is read only in stdio mode — an HTTP deployment ignores it, so it can never end
+up serving a key of its own to remote callers.
+
 HTTP **connections** are nevertheless pooled process-wide, which cuts roughly
 93ms — a TCP and TLS handshake — off every call. The split is deliberate: a
 connection pool is keyed by host, not by credential, so it can be shared safely,
@@ -45,7 +51,45 @@ variables.
 
 ## Connecting a client
 
-### Claude Code
+### Running locally over stdio (uvx)
+
+No hosted server needed: an MCP client can spawn the server itself with
+[`uvx`](https://docs.astral.sh/uv/guides/tools/) and talk to it over stdio. The
+key goes in `TFNSW_API_KEY`.
+
+```bash
+uvx --from git+https://github.com/maxim75/tfnsw_trip_planner_mcp tfnsw-trip-planner-mcp --transport stdio
+```
+
+Claude Code:
+
+```bash
+claude mcp add tfnsw --env TFNSW_API_KEY=YOUR_KEY -- uvx --from git+https://github.com/maxim75/tfnsw_trip_planner_mcp tfnsw-trip-planner-mcp --transport stdio
+```
+
+Claude Desktop (or any client with a JSON `mcpServers` config):
+
+```json
+{
+  "mcpServers": {
+    "tfnsw": {
+      "command": "uvx",
+      "args": [
+        "--from", "git+https://github.com/maxim75/tfnsw_trip_planner_mcp",
+        "tfnsw-trip-planner-mcp", "--transport", "stdio"
+      ],
+      "env": { "TFNSW_API_KEY": "YOUR_KEY" }
+    }
+  }
+}
+```
+
+From a local checkout, use `--from /path/to/tfnsw_trip_planner_mcp` instead.
+`MCP_TRANSPORT=stdio` works in place of `--transport stdio`. Without
+`TFNSW_API_KEY` the server still starts and answers `initialize`/`tools/list`,
+but every tool call returns an error naming the variable.
+
+### Claude Code (hosted server)
 
 Header support is built in:
 
@@ -53,7 +97,7 @@ Header support is built in:
 claude mcp add --transport http tfnsw https://your-host/mcp --header "X-API-Key: YOUR_KEY"
 ```
 
-### Claude Desktop
+### Claude Desktop (hosted server)
 
 Claude Desktop's (and claude.ai's) native **"Add custom connector"** UI accepts a
 URL and OAuth credentials only — it has **no field for a custom header**, so it
@@ -259,16 +303,19 @@ uv sync
 uv run python -m tfnsw_trip_planner_mcp
 ```
 
-### Stdio (for local process-spawning clients and directory scanners)
+`--host` and `--port` override `HOST` and `PORT`; `--help` lists every option.
+
+### Stdio
 
 ```bash
-MCP_TRANSPORT=stdio uv run python -m tfnsw_trip_planner_mcp
+TFNSW_API_KEY=your_key uv run tfnsw-trip-planner-mcp --transport stdio
 ```
 
-There are no HTTP headers under stdio, so every tool call fails with a missing-API-key
-error — this mode only serves the `initialize`/`tools-list` handshake (e.g. for MCP
-directory scanners that spawn the container and speak stdio rather than HTTP). The
-default deployment above (Docker/Coolify, `/mcp` and `/sse`) is unaffected either way.
+See [Running locally over stdio](#running-locally-over-stdio-uvx) for client
+configs. Directory scanners that spawn the container speak stdio too; they need
+no key, since they only check the `initialize`/`tools/list` handshake. Run the
+image that way with `-e MCP_TRANSPORT=stdio`. The default deployment above
+(Docker/Coolify, `/mcp` and `/sse`) is unaffected.
 
 ### Tests
 
@@ -301,8 +348,9 @@ pull requests never receive the secret, so they always skip.
 | File | Role |
 |---|---|
 | `server.py` | The 10 tools and their argument mapping |
-| `auth.py` | `X-API-Key` extraction and per-call client lifecycle |
+| `auth.py` | `X-API-Key` extraction (or `TFNSW_API_KEY` under stdio) and per-call client lifecycle |
 | `serialization.py` | Library dataclasses → JSON-safe structures |
 | `app.py` | ASGI app wiring both transports plus `/health` |
+| `__main__.py` | CLI entry point: `--transport http` (default) or `stdio` |
 
 [![TfNSW Trip Planner MCP Server MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/maxim75/tfnsw_trip_planner_mcp/badges/card.svg)](https://glama.ai/mcp/servers/maxim75/tfnsw_trip_planner_mcp)

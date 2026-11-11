@@ -19,7 +19,7 @@ from pydantic import Field
 from tfnsw_trip_planner import APIError, NetworkError, TripPlannerClient
 from tfnsw_trip_planner.models.enums import CyclingProfile
 
-from .auth import API_KEY_HEADER, MissingAPIKeyError, client_for
+from .auth import API_KEY_ENV, API_KEY_HEADER, MissingAPIKeyError, client_for
 from .serialization import to_jsonable
 
 __all__ = ["mcp", "parse_when"]
@@ -28,7 +28,9 @@ INSTRUCTIONS = f"""\
 Live public transport data for Sydney and New South Wales, Australia, from the
 Transport for NSW Open Data APIs.
 
-Every request must carry a TfNSW API key in the {API_KEY_HEADER} HTTP header.
+Over HTTP, every request must carry a TfNSW API key in the {API_KEY_HEADER}
+header. Over stdio, the key comes from the {API_KEY_ENV} environment variable
+of the server process.
 
 To plan a journey, call plan_trip with plain place names — origin="100 Harris
 Street Pyrmont", destination="Bondi Junction". It resolves them itself, so do

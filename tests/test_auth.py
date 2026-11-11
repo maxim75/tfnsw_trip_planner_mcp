@@ -191,3 +191,43 @@ def test_client_for_handles_a_context_with_no_headers_at_all():
     with pytest.raises(MissingAPIKeyError):
         with client_for(FakeContext(None)):
             pass
+
+
+@pytest.fixture
+def stdio_key():
+    """Register a stdio key for one test and always clear it again."""
+    yield auth.set_stdio_api_key
+    auth.set_stdio_api_key(None)
+
+
+def test_stdio_key_is_used_when_there_are_no_headers(stdio_key):
+    assert stdio_key("env-key") is True
+    with client_for(FakeContext(None)) as client:
+        assert client.api_key == "env-key"
+
+
+def test_stdio_key_accepts_the_same_forms_as_the_header(stdio_key):
+    stdio_key("  apikey env-key \n")
+    with client_for(FakeContext(None)) as client:
+        assert client.api_key == "env-key"
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", "apikey "])
+def test_blank_stdio_key_is_not_registered(stdio_key, value):
+    assert stdio_key(value) is False
+    with pytest.raises(MissingAPIKeyError) as excinfo:
+        with client_for(FakeContext(None)):
+            pass
+    # Under stdio the caller needs to be told about the env var, not a header.
+    assert auth.API_KEY_ENV in str(excinfo.value)
+
+
+def test_stdio_key_never_applies_to_a_request_that_has_headers(stdio_key):
+    # An HTTP request always carries headers, so a registered stdio key must not
+    # stand in for a missing X-API-Key there.
+    stdio_key("env-key")
+    with pytest.raises(MissingAPIKeyError):
+        with client_for(FakeContext({})):
+            pass
+    with client_for(FakeContext({"x-api-key": "header-key"})) as client:
+        assert client.api_key == "header-key"
