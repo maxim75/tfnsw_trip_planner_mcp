@@ -153,6 +153,15 @@ Notes:
 - **Times.** Tools taking a `when` accept ISO 8601, e.g. `2026-08-30T09:15`.
   Without an offset the value is Australia/Sydney local time. An unparseable
   value is rejected rather than ignored.
+- **Errors.** A failed call is a tool error carrying TfNSW's own message. That
+  includes the errors the trip planner reports inside an HTTP 200, such as an
+  invalid origin or destination ID: those are errors now, not an empty result.
+  "No route found" is still an empty list. `get_departures` is unchanged: TfNSW
+  answers an unknown stop ID with an empty board, not an error. Network errors
+  and HTTP 429/502/503/504 are retried twice with backoff before failing; a rate limit
+  that outlasts the retries is reported as one, with the wait TfNSW asked for,
+  so a model backs off instead of retrying into the same quota. (All of this
+  needs `tfnsw-trip-planner` 1.5.0, the minimum this server depends on.)
 - **Capped results.** `get_alerts`, `find_nearby` and `get_vehicle_positions`
   can each answer with far more than a caller can use — an unfiltered alert
   fetch returns every alert in NSW (~280, 1.3MB of JSON), and a 500m nearby
@@ -183,8 +192,9 @@ Notes:
 
 - **`origin_type` defaults to `"any"`, not `"stop"`.** An address resolves to a
   `streetID:...` ID of type `singlehouse`, and planning it with `type_origin=stop`
-  returns **zero journeys** — verified against the live API. The old `"stop"`
-  default silently failed every address-to-address trip.
+  returned **zero journeys** — verified against the live API. The old `"stop"`
+  default silently failed every address-to-address trip. (Since
+  `tfnsw-trip-planner` 1.5.0 it fails loudly instead, with "stop invalid".)
 
 - **Journey detail.** The journey tools take a `detail` level, because the raw
   response is overwhelmingly data a model never reads. Journey totals
@@ -265,8 +275,8 @@ Notes:
 
   The list is taken from the library rather than restated here, so the two
   cannot drift. TfNSW serves `sydneytrains` and `lightrail/innerwest` from a
-  **v2** endpoint and the rest from v1; `tfnsw-trip-planner` 1.4.0 routes each
-  feed to the version that actually serves it.
+  **v2** endpoint and the rest from v1; `tfnsw-trip-planner` routes each
+  feed to the version that actually serves it (since 1.4.0).
 
 Results are returned as structured JSON. Every list-returning tool answers with
 the same shape, so `returned` is always present and `count` is always the true

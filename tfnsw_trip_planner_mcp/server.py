@@ -16,7 +16,7 @@ import anyio.to_thread
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
-from tfnsw_trip_planner import APIError, NetworkError, TripPlannerClient
+from tfnsw_trip_planner import APIError, NetworkError, RateLimitError, TripPlannerClient
 from tfnsw_trip_planner.models.enums import CyclingProfile
 
 from .auth import API_KEY_ENV, API_KEY_HEADER, MissingAPIKeyError, client_for
@@ -128,6 +128,19 @@ async def _run(ctx: Context, work: Any) -> Any:
             return await anyio.to_thread.run_sync(functools.partial(work, client))
     except MissingAPIKeyError as exc:
         raise ToolError(str(exc)) from None
+    except RateLimitError as exc:
+        # Before APIError, which it subclasses. The library has already retried
+        # with backoff by the time this is raised, so the one thing a model can
+        # usefully do is stop: an immediate retry spends more of the same quota.
+        wait = (
+            f" TfNSW asked for a {round(exc.retry_after)}s wait."
+            if exc.retry_after is not None
+            else ""
+        )
+        raise ToolError(
+            "TfNSW rate limit or quota exceeded for this API key, after automatic "
+            f"retries.{wait} Do not retry immediately. ({_redact(ctx, str(exc))})"
+        ) from None
     except APIError as exc:
         raise ToolError(f"TfNSW API request failed: {_redact(ctx, str(exc))}") from None
     except NetworkError as exc:
@@ -487,8 +500,7 @@ async def plan_trip(
             offset this is Sydney local time. Defaults to now.
         arrive_by: Treat `when` as the desired arrival time instead of departure.
         origin_type: Kind of the origin ID. Leave as "any", which resolves stops,
-            addresses and POIs alike; "stop" rejects address IDs and returns
-            nothing for them.
+            addresses and POIs alike; "stop" rejects address IDs with an error.
         destination_type: Kind of the destination ID. Leave as "any".
         realtime: Include live delay information.
         wheelchair: Return only wheelchair-accessible journeys.
@@ -761,7 +773,8 @@ async def get_alerts(
         when: Optional ISO 8601 date/time to check alerts for; Sydney local time
             if no offset given. Defaults to now.
         stop_id: Restrict to alerts affecting one stop. Omit for network-wide.
-        current_only: Only alerts in effect now. Set false to include future ones.
+        current_only: Only alerts in effect now. Set false to also include
+            historic ones that are no longer in effect.
         max_results: Maximum alerts to return.
         concise: Return each alert's subtitle, url, last_modification, and the
             affected_lines and affected_stops as lists of line numbers and stop

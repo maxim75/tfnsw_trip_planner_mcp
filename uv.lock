@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -994,14 +994,15 @@ wheels = [
 
 [[package]]
 name = "tfnsw-trip-planner"
-version = "1.4.0"
+version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "requests" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/69/ac/e4e4717dc4353cae51db7b35b7bc55e3e7b576ef57e9c73359758ef2f319/tfnsw_trip_planner-1.4.0.tar.gz", hash = "sha256:afb426c7efc994051b9ddef45874627aac7d2a13836337106af4f9ecb4b4779b", size = 28228, upload-time = "2026-08-29T12:54:11.108Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5b/d8/7baeaeca8f29a11fba8fc9f4def8d7e72f2092a8a73bfe1f0b90a9d08ca0/tfnsw_trip_planner-1.5.0.tar.gz", hash = "sha256:3855b0135563a2f9780d6b7419a2b5790c9c0a61fabef31a31c350c4a4219013", size = 36086, upload-time = "2026-11-12T06:33:46.936Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fc/cf/11412502b2099ac1ed54fe692a7701e3e4c872a241fcdefc0bbe1576bc2d/tfnsw_trip_planner-1.4.0-py3-none-any.whl", hash = "sha256:9fe3b205c05b583fbc18136909bcf497b04e6fa16b1fd2742a58dbc5b3a9655c", size = 23871, upload-time = "2026-08-29T12:54:09.709Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/a0/292b6641fdca5ae40e3c0808da3585d68e0ee4ef4c3b6363df648efea3ea/tfnsw_trip_planner-1.5.0-py3-none-any.whl", hash = "sha256:5e85042187c026fc53fb8bf0e55856b7db6c45b1d66b682c4e8d1e93ef284959", size = 26634, upload-time = "2026-11-12T06:33:45.589Z" },
 ]
 
 [package.optional-dependencies]
@@ -1032,7 +1033,7 @@ dev = [
 requires-dist = [
     { name = "mcp", specifier = ">=2.1.1" },
     { name = "starlette", specifier = ">=0.37.0" },
-    { name = "tfnsw-trip-planner", extras = ["realtime"], specifier = ">=1.4.0" },
+    { name = "tfnsw-trip-planner", extras = ["realtime"], specifier = ">=1.5.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30.0" },
 ]
 
@@ -1072,6 +1073,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a3/26/b09b8010994eccc3c09092e6b34058f36a460eea2d4c3e8b910c695975a0/typing_inspection-0.4.4.tar.gz", hash = "sha256:547274fa6b0a561ccf549cc9524b999a578e737d015d8709d021f9d0d13bea47", size = 76928, upload-time = "2026-08-12T12:37:25.997Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/67/81/4add07e5172b7ac40d8ed5ff580409a7801a4fe26d529bdd915401dabfbe/typing_inspection-0.4.4-py3-none-any.whl", hash = "sha256:65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147", size = 14750, upload-time = "2026-08-12T12:37:24.648Z" },
+]
+
+[[package]]
+name = "tzdata"
+version = "2026.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/29/6a1391d31cd00ff9e927215a224a880e1e84e826b64ba80a499e51c074d8/tzdata-2026.6.tar.gz", hash = "sha256:85d2cd9c09f81f0bb29db27759fc83af4f1e620efb814f8c5bf8b4cc4feece6d", size = 201017, upload-time = "2026-10-28T09:57:09.137Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0a/66/9a06c2227fedfd4919f0eaaa8b94377d9730882a7e4f95823c9a331ab5e1/tzdata-2026.6-py2.py3-none-any.whl", hash = "sha256:0a10eec6e13ef16b627fabed9a5f2ba61a62b1c67f327305f4e7e412a70b4aec", size = 348210, upload-time = "2026-10-28T09:57:07.276Z" },
 ]
 
 [[package]]
