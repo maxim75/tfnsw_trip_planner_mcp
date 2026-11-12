@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
-from tfnsw_trip_planner import APIError, NetworkError
+from tfnsw_trip_planner import APIError, NetworkError, RateLimitError
 from tfnsw_trip_planner.models import Coordinate, Journey, Leg, Location
 from tfnsw_trip_planner.models.enums import CyclingProfile, LocationType, TransportMode
 from tfnsw_trip_planner.models.service_alert import ServiceAlert
@@ -759,6 +759,51 @@ async def test_api_errors_are_reported_with_their_status_code(ctx, client):
     assert "403" in str(excinfo.value)
 
 
+async def test_an_upstream_error_on_a_200_response_reaches_the_caller(ctx, client):
+    # tfnsw-trip-planner 1.5.0 raises for errors TfNSW reports in the body of an
+    # HTTP 200, where it used to return []. Verbatim from the live API for an
+    # address ID planned as type "stop". The text is the only thing telling a
+    # model its input was wrong rather than that no route exists.
+    client.plan_trip.side_effect = APIError(
+        "API error: origin: stop invalid; destination: stop invalid", status_code=200, code=-2000
+    )
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.plan_trip(origin_id="A", destination_id="B", ctx=ctx)
+
+    assert "stop invalid" in str(excinfo.value)
+
+
+async def test_a_rate_limit_tells_the_caller_to_back_off(ctx, client):
+    client.find_stop.side_effect = RateLimitError("Rate limit or quota exceeded", retry_after=12.4)
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.find_stop(query="Circular Quay", ctx=ctx)
+
+    message = str(excinfo.value)
+    assert "rate limit" in message.lower()
+    assert "12s" in message
+    assert "Do not retry immediately" in message
+
+
+async def test_a_rate_limit_without_retry_after_still_reads_cleanly(ctx, client):
+    client.find_stop.side_effect = RateLimitError("Rate limit or quota exceeded")
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.find_stop(query="Circular Quay", ctx=ctx)
+
+    assert "wait" not in str(excinfo.value)
+
+
+async def test_the_api_key_never_appears_in_a_rate_limit_message(ctx, client):
+    client.find_stop.side_effect = RateLimitError("Rate limit exceeded for test-key")
+
+    with pytest.raises(ToolError) as excinfo:
+        await server.find_stop(query="Circular Quay", ctx=ctx)
+
+    assert "test-key" not in str(excinfo.value)
+
+
 async def test_network_errors_are_reported_as_tool_errors(ctx, client):
     client.get_departures.side_effect = NetworkError("Connection error: refused")
 
@@ -976,7 +1021,10 @@ async def test_journey_carries_the_answer_without_reading_any_leg(tool_name, ctx
     journey = result["journeys"][0]
     assert journey["departure"] == "2026-09-08T18:08:00+10:00"
     assert journey["arrival"] == "2026-09-08T19:31:00+10:00"
-    assert journey["duration_min"] == 50
+    # Door to door, 18:08 -> 19:31. The legs sum to only 50 minutes: the other
+    # 33 are spent waiting between them, which tfnsw-trip-planner <=1.4.0 left
+    # out, so the duration contradicted the two times printed beside it.
+    assert journey["duration_min"] == 83
     assert journey["via"] == "Walk Alt → Bus → Train → Walk Alt"
 
 
@@ -987,6 +1035,26 @@ async def test_changes_counts_interchanges_not_walking_legs(ctx, client):
     result = await server.plan_trip(origin_id="A", destination_id="B", ctx=ctx)
 
     assert result["journeys"][0]["changes"] == 1
+
+
+async def test_a_metro_leg_is_named_as_metro_and_counts_as_a_change(ctx, client):
+    # tfnsw-trip-planner <=1.4.0 had no product class 2, so every Sydney Metro
+    # leg came back as mode "UNKNOWN" and `via` read "Train → Unknown".
+    client.plan_trip.return_value = [
+        Journey(
+            legs=[
+                make_leg(mode=TransportMode.from_class(1)),
+                make_leg(mode=TransportMode.from_class(2)),
+            ]
+        )
+    ]
+
+    result = await server.plan_trip(origin_id="A", destination_id="B", ctx=ctx)
+
+    journey = result["journeys"][0]
+    assert [leg["mode"] for leg in journey["legs"]] == ["TRAIN", "METRO"]
+    assert journey["via"] == "Train → Metro"
+    assert journey["changes"] == 1
 
 
 async def test_a_walk_only_journey_reports_zero_changes(ctx, client):
